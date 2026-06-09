@@ -554,3 +554,9 @@ role-memory/
 ├── requirements.txt         # Python 依赖
 └── pytest.ini               # 测试配置
 ```
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=bank010/role-memory&type=Date)](https://star-history.com/#bank010/role-memory&Date)
