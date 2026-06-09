@@ -1,157 +1,556 @@
-# 角色扮演记忆系统 · Demo
+# Role Memory — AI 角色扮演长期记忆系统
 
-面向**全球多语言 AI 社交陪伴产品**的角色扮演长期记忆系统。把记忆拆成分层结构，
-写路径异步加工、读路径毫秒拼装，按 **用户 × 角色** 完全隔离存储，并用一个可视化界面
-让你**看见记忆是怎么长出来、又怎么被召回**的。
+面向**全球多语言 AI 社交陪伴产品**的角色扮演长期记忆引擎。
 
-## 核心特性
+把记忆拆分为五层结构，写路径全程异步加工（不阻塞对话）、读路径毫秒级拼装，
+按 **用户 × 角色** 完全隔离存储，配一个可视化 Demo 让你**看见记忆是怎么长出来、又怎么被召回**的。
 
-- **分层记忆模型**：人设 / 结构化画像（事实）/ 关系状态 / 情节 / 逐字原话，各司其职。
-- **用户 × 角色隔离**：每个 `(user_id, role_id)` 组合是一段完全独立的记忆（独立画像、关系、事件）。同一用户对不同角色互不串扰，支持 1 对多 / 多对多。
-- **多语言原生**：用 Qwen3-Embedding 直接对原文向量化，无需翻译，跨语言召回（中/英/日…）。
-- **两阶段检索**：向量粗召回 → Qwen3-Reranker 精排，显著提升相关性。
-- **结构化画像**：14 模块 schema 引导抽取，**默认可追加**（同类多值并存），仅天然单值属性（年龄/职业/性取向等）覆盖更新。
-- **真名存储**：情节/画像/摘要直接用真实角色名/用户名写入，展示与检索都自然。
-- **NSFW 分级**：敏感画像与事件打 `sensitive` 标记，`NSFW_ENABLED` 总开关控制提取与注入。
-- **主动推进剧情**：注入引导让 AI 不被动应答，每轮推进情节并给出明确钩子。
-- **上线加固**：session 级加工锁（防并发竞态）、加工失败不丢记忆、94 项回归测试。
+## Demo 预览
 
-## 记忆分层
+![Demo 截图：左侧对话界面，右侧实时展示情节记忆面板（重要度/情绪/轮次标签）](image/image.png)
 
-| 层 | 内容 | 存储 |
-|---|---|---|
-| L0 人设 | 角色是谁（静态，含 `{{char}}`/`{{user}}` 占位符） | `app/personas.py` |
-| L1 结构化画像 | 用户事实/偏好（14 模块 schema，带置信度、可追加） | `facts` 表 |
-| L1 关系状态 | 亲密度/信任/情绪/滚动摘要 | `relationship` 表 |
-| L2 情节记忆 | 发生过的事（事件+向量，三维打分召回，带 `sensitive`） | `episodes` 表 |
-| L3 逐字记忆 | 每轮原话（向量+关键词混合检索，管精确细节） | `chunks` 表 |
-| 真相源 | 原始对话日志（append-only，可重建一切） | `turns` 表 |
+> 左侧为对话主界面，右侧**情节记忆（全部）**面板实时展示已抽取的情节记忆条目，每条附带重要度、情绪标签、所在轮次，以及 Insight（反思洞察）注释。底部状态栏显示「每 3 轮触发记忆加工一次，左侧面板/关系/状态在加工后更新」。
 
-- **读路径**（在线、快）：`assembler.build_context` 查缓存并拼装上下文，不做 LLM 计算；注入时把记忆里的占位符/真名对齐到当前会话。
-- **写路径**（离线、异步）：`pipeline.maybe_process` 每 `PROCESS_EVERY` 轮触发事实抽取 / 情节归纳 / 关系更新 / 滚动摘要 / 反思。**session 级锁保证同会话串行，加工失败不推进进度（下次重试不丢记忆）**。
-- **检索打分**：情节按 `relevance × recency × importance` 三维打分，再经 reranker 精排；逐字按 `向量 + 关键词` 混合。
-
-## 数据隔离：用户 × 角色
-
-所有表都带 `user_id` / `role_id` 独立列 + 索引，内部以 `session = user_id␟role_id` 作主键。
-
-```
-用户 U1 ──┬── 角色 A：独立画像 + 关系 + 事件
-          └── 角色 B：另一套，互不干扰
-用户 U2 ──── 角色 A：又是独立的一套
-```
-
-好处：记忆隔离正确、检索候选集更小（更快）、支持运营查询（某用户的全部角色 / 某角色的全部用户）。
-
-## 存储后端（可插拔）
-
-业务层 `app/memory/stores.py` 只面向 `app/store/base.py` 接口编程，换后端只改环境变量 `STORE_BACKEND`：
-
-| 后端 | 适用 | 向量 | 召回 |
-|---|---|---|---|
-| `sqlite`（默认） | 零依赖、开箱跑 | float32 blob | 内存内三维打分 |
-| `postgres` | 生产级 | pgvector `vector` 列 + HNSW 索引 | 原生 KNN 预筛 + 三维重排 |
-
-**Redis 热缓存**（`app/cache.py`）：缓存 `facts` / `relationship` 这两条对话主链路上的热读，
-读穿透 + 写失效 + TTL 兜底。**Redis 未配置或不可用时自动降级为直查后端，业务无感**（旁路优化，绝不成为故障点）。
-
-## 运行
-
-```bash
-cd role-memory-demo
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# 配置模型端点（不配 CHAT_API_KEY 则自动进 mock 模式，照样能跑）
-cp .env.example .env   # 然后按需填写下方环境变量
-
-uvicorn app.main:app --reload --port 8011
-```
-
-打开 http://localhost:8011
-
-### 关键环境变量
-
-```bash
-# 对话端点（角色扮演回复）
-CHAT_API_KEY=...        CHAT_BASE_URL=...        CHAT_MODEL=...
-# 抽取/摘要端点（可与对话分开：对话放得开，抽取要稳）。留空则复用对话端点
-EXTRACT_API_KEY=...     EXTRACT_BASE_URL=...     EXTRACT_MODEL=...   EXTRACT_JSON_MODE=1
-# 多语言向量端点（Qwen3-Embedding via vLLM）
-EMBED_API_KEY=vllm      EMBED_BASE_URL=.../v1    EMBED_MODEL=...     EMBED_DIM=4096
-# 精排端点（Qwen3-Reranker via vLLM）。留空则关闭，检索退回纯向量召回
-RERANK_BASE_URL=.../v1  RERANK_MODEL=...         RERANK_API_KEY=vllm
-# 记忆参数
-WORKING_WINDOW=6  PROCESS_EVERY=3  RETRIEVE_TOP_K=4  RECENCY_DECAY=0.02
-# 开关
-NSFW_ENABLED=1          # 敏感画像/事件的提取与注入总开关
-NORMALIZE_ENABLED=0     # 用多语言 embedding 时关闭（直接 embed 原文，省一次翻译）
-```
-
-### 切到生产级存储（Postgres + Redis）
-
-```bash
-docker compose up -d        # 拉起 pgvector + redis
-# 在 .env 写：
-#   STORE_BACKEND=postgres
-#   PG_DSN=postgresql://memory:memory@localhost:5432/role_memory
-#   REDIS_URL=redis://localhost:6379/0
-uvicorn app.main:app --port 8011
-```
-
-业务代码零改动，启动日志会打印 `store=postgres | cache=True`。
-
-## 两种模式
-
-- **真实模式**：配置了 `CHAT_API_KEY`（OpenAI / DeepSeek / 任意兼容网关）。抽取/摘要/回复都由模型完成。
-- **Mock 模式**：不配 key。正则抽取 + 模板回复 + 本地哈希向量。回复很"傻"，但**记忆的抽取/存储/召回/关系演进机制完全真实可见**，适合先看架构跑通。
-
-## API
-
-| 端点 | 说明 |
-|---|---|
-| `POST /api/chat` | 聊天，参数含 `user_id` / `role_id` / `message` / `persona_id` / `char_name` / `user_name` |
-| `GET /api/memory` | 查某 `(user_id, role_id)` 的画像 / 情节 / 关系 |
-| `GET /api/history` | 恢复最近 N 轮对话（刷新页面用） |
-| `POST /api/reprocess` | 重置加工进度，用新逻辑从头重抽（prompt 改动后补救旧 session） |
-| `POST /api/reset` | 清空该会话记忆 |
-| `GET /api/health` | 健康检查（含各后端/精排开关状态） |
-
-## 测试
-
-```bash
-pytest -q        # 离线运行（强制本地哈希向量，不打真实网络），全套约 1 秒
-```
-
-覆盖：key 归一化 / entity 派生 / 追加 vs 覆盖 / 三维打分 / 情节去重 / (用户×角色) 隔离 / session 加工锁串行性 / 校验兜底。
-需要 Postgres 集成测试时设 `RUN_PG_TESTS=1`。
+---
 
 ## 目录
 
+- [Demo 预览](#demo-预览)
+- [核心特性](#核心特性)
+- [架构概览](#架构概览)
+- [记忆分层](#记忆分层)
+- [一轮对话的完整链路](#一轮对话的完整链路)
+- [记忆加工：调度与游标机制](#记忆加工调度与游标机制)
+- [检索：三维打分 + 两阶段 Rerank](#检索三维打分--两阶段-rerank)
+- [用户画像：14 模块 Schema](#用户画像14-模块-schema)
+- [数据隔离：用户 × 角色](#数据隔离用户--角色)
+- [存储后端（可插拔）](#存储后端可插拔)
+- [快速开始](#快速开始)
+- [环境变量完整说明](#环境变量完整说明)
+- [生产级部署](#生产级部署)
+- [API 接口](#api-接口)
+- [目录结构](#目录结构)
+
+---
+
+## 核心特性
+
+| 特性 | 说明 |
+|---|---|
+| **分层记忆模型** | L0 人设 / L1 画像+关系 / L2 情节 / L3 逐字原话，各层独立演进 |
+| **用户 × 角色隔离** | `(user_id, role_id)` 完全隔离，1:N / N:N，独立画像、关系、事件 |
+| **多语言原生** | Qwen3-Embedding 直接对原文向量化，无需翻译，中/英/日跨语言召回 |
+| **两阶段检索** | 向量粗召回 → Qwen3-Reranker 精排，显著提升相关性 |
+| **14 模块结构化画像** | 覆盖身份/性格/兴趣/NSFW 等，默认可追加（同类多值并存） |
+| **真名存储** | 情节/画像/摘要直接用真实角色名/用户名写入，自然可读 |
+| **NSFW 分级** | `sensitive` 标记隔离，`NSFW_ENABLED` 总开关控制提取与注入 |
+| **主动推进剧情** | System prompt 内嵌叙事引导，AI 主动制造情节、不被动应答 |
+| **并发安全** | session 级异步加工锁，同会话串行；加工失败不推进游标，下次重试不丢记忆 |
+| **可插拔存储** | SQLite（零依赖）/ PostgreSQL + pgvector + HNSW（生产级），一行配置切换 |
+| **Redis 热缓存** | facts/relationship 热读缓存，未配置时自动降级，绝不成为故障点 |
+| **CORS 支持** | 内置跨域中间件，前后端分离开箱即用 |
+
+---
+
+## 架构概览
+
 ```
-app/
-  main.py            FastAPI：/api/chat /api/memory /api/history /api/reprocess /api/reset /api/health
-  config.py          配置（环境变量，含后端/缓存/NSFW/归一化开关）
-  schemas.py         请求体模型（含 user_id/role_id）
-  session.py         会话标识：(user_id, role_id) <-> session 组装/拆解
-  llm.py             LLM 客户端（对话 + 抽取双端点，OpenAI 兼容 + mock）
-  embeddings.py      向量（Qwen3-Embedding + 本地哈希降级）
-  rerank.py          Qwen3-Reranker 精排（封装官方 chat 模板）
-  normalizer.py      多语言归一化（可选，默认关）
-  personas.py        L0 人设（自动加载 RolePrompts）
-  cache.py           Redis 热缓存（读穿透/写失效/优雅降级）
-  store/             ★ 存储后端（仓储模式，可插拔，均带 user_id/role_id 列+索引）
-    base.py          后端接口（ABC）
-    sqlite_store.py  SQLite 实现（默认）
-    postgres_store.py PostgreSQL + pgvector 实现（生产级）
-    __init__.py      工厂：按 STORE_BACKEND 选实现
-  memory/
-    profile_schema.py 14 模块结构化画像 schema（多值/敏感/单值定义）
-    stores.py        各类记忆【编排层】（向量化/去重/语义合并/缓存/淘汰）
-    retrieval.py     情节三维打分 + 逐字混合检索 + reranker 精排
-    assembler.py     上下文拼装 + 占位符填充 + 主动推进剧情引导 + 反幻觉护栏
-    pipeline.py      异步记忆加工（抽取/归纳/关系/摘要/反思 + session 锁）
-tests/               回归测试（离线、约 1 秒）
-static/              可视化前端（用户ID + 角色切换，切换即换记忆）
-docker-compose.yml   一键拉起 pgvector + redis
+┌─────────────────────────────────────────────────────────────┐
+│                         前端 / 调用方                         │
+└───────────────────────────┬─────────────────────────────────┘
+                            │  POST /api/chat
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      FastAPI  app/main.py                    │
+│                                                              │
+│  ┌──────── 读路径（在线，毫秒级）────────────────────────┐   │
+│  │  1. assembler.build_context                          │   │
+│  │     ├─ L0 人设（前端直传 persona_text）               │   │
+│  │     ├─ L1 facts（画像）+ relationship（关系/摘要）    │   │
+│  │     ├─ L2 情节向量召回 → Reranker 精排               │   │
+│  │     └─ L3 逐字向量+关键词混合召回                     │   │
+│  │  2. llm.chat(messages) → reply                      │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌──────── 写路径（离线，异步不阻塞）──────────────────┐   │
+│  │  3. turns 表 append_turn（原话落库）                 │   │
+│  │  4. asyncio.create_task(_index_and_process)         │   │
+│  │     ├─ chunks 逐字向量化（每轮）                      │   │
+│  │     └─ pipeline.maybe_process（每 N 轮触发）         │   │
+│  │         ├─ 事实抽取 → facts 表                       │   │
+│  │         ├─ 情节归纳 → episodes 表                    │   │
+│  │         ├─ 关系更新 → relationship 表                │   │
+│  │         ├─ 滚动摘要 → relationship.summary           │   │
+│  │         └─ 反思洞察 → episodes [insight]             │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            │
+              ┌─────────────┼──────────────┐
+              ▼             ▼              ▼
+          SQLite /      Redis 缓存     Embedding /
+          Postgres      (可选)         Reranker
+         (6 张表)                      (vLLM)
+```
+
+---
+
+## 记忆分层
+
+| 层 | 名称 | 内容 | 存储表 | 带向量 | 写入时机 |
+|---|---|---|---|---|---|
+| L0 | 人设 | 角色系统提示词（静态，含 `{{char}}`/`{{user}}` 占位符） | 前端管理 | — | 每轮注入 |
+| L1 | 结构化画像 | 用户事实/偏好，14 模块，带置信度，默认可追加 | `facts` | ✅ | 每 N 轮抽取 |
+| L1 | 关系状态 | 亲密度/信任度/情绪/阶段/滚动摘要 | `relationship` | — | 每 N 轮更新 |
+| L2 | 情节记忆 | 发生过的事件，带重要度/情绪/敏感标记 | `episodes` | ✅ | 每 N 轮归纳 |
+| L3 | 逐字记忆 | 每轮原话，管精确细节 | `chunks` | ✅ | 每轮写入 |
+| — | 真相源 | 原始对话日志（append-only，可重建一切） | `turns` | — | 每轮写入 |
+
+### 读路径（在线，每轮）
+
+```
+用户消息 → query 向量化
+         → L2 情节粗召回(TopK×4) → Reranker 精排 → TopK
+         → L3 逐字粗召回          → Reranker 精排 → TopK
+         → 拼装 system prompt（L0+L1+L2+L3+对话窗口）
+         → LLM 生成回复
+```
+
+### 写路径（异步，不阻塞回复）
+
+```
+对话结束 → turns 落库（同步，立即）
+         → create_task（异步，不等待）：
+             逐字向量化 index_chunk（每轮）
+             maybe_process（差值 ≥ PROCESS_EVERY 才触发）：
+               LLM 抽取 facts + episode + relationship_delta
+               LLM 更新滚动摘要
+               LLM 反思洞察（更长周期）
+               last_processed 游标推进
+```
+
+---
+
+## 一轮对话的完整链路
+
+```
+用户发消息
+    │
+    ▼ [读路径，毫秒级]
+① query 向量化（Qwen3-Embedding）
+② 情节库粗召回 top-16 → Reranker 精排 → top-4
+③ 逐字库粗召回 top-16 → Reranker 精排 → top-4
+④ 从 Redis/DB 取 facts + relationship
+⑤ 拼装 system prompt
+⑥ LLM 生成回复
+    │ 立即返回给用户
+    │
+    ▼ [写路径，后台异步]
+⑦ turns 表写入本轮原话
+⑧ user/assistant 各 embed 一条 → chunks 表
+⑨ max_turn - last_processed ≥ 3 ？
+      是 → 加工锁 → LLM 抽取 JSON：
+              facts（用户稳定偏好） → facts 表
+              episode（本批事件）  → episodes 表
+              relationship delta  → relationship 表
+           LLM 更新滚动摘要
+           last_processed = max_turn（成功才推进）
+      否 → 结束
+```
+
+---
+
+## 记忆加工：调度与游标机制
+
+加工状态不在内存里，而是持久化在数据库 `meta` 表：
+
+```sql
+CREATE TABLE meta (
+    session TEXT PRIMARY KEY,   -- user_id + role_id 组成的会话键
+    last_processed_turn INTEGER DEFAULT 0  -- 已加工到第几轮
+);
+```
+
+触发判断（两级检查，防并发重复加工）：
+
+```python
+# 锁外预检（避免无谓抢锁）
+if max_turn - last_processed < PROCESS_EVERY:
+    return
+
+async with session_lock:  # session 级锁，不同会话互不阻塞
+    # 锁内二次确认（可能已被其他协程加工）
+    if max_turn - last_processed < PROCESS_EVERY:
+        return
+    await _process(...)
+    last_processed = max_turn  # 成功才推进，失败下次重试
+```
+
+**时间轴示例**（PROCESS_EVERY=3）：
+
+| 轮次 | last_processed | 差值 | 是否加工 |
+|---|---|---|---|
+| 1 | 0 | 1 | ❌ |
+| 2 | 0 | 2 | ❌ |
+| **3** | 0 | 3 | ✅ → 推进到 3 |
+| 4 | 3 | 1 | ❌ |
+| **6** | 3 | 3 | ✅ → 推进到 6 |
+
+---
+
+## 检索：三维打分 + 两阶段 Rerank
+
+### 情节三维打分
+
+```
+score = w_r × relevance + w_t × recency + w_i × importance
+      = 0.55 × cos_sim(query, episode)
+      + 0.20 × exp(-RECENCY_DECAY × turns_ago)
+      + 0.25 × (importance / 10)
+```
+
+### 两阶段检索流程
+
+```
+query → embed → 向量粗召回 top-(K×4)
+              → RERANK_ENABLED ?
+                  是 → Qwen3-Reranker 精排 → top-K
+                  否 → 三维打分排序    → top-K
+              → 注入 system prompt
+```
+
+Reranker 使用 Qwen3 官方 chat 模板（`rerank.py` 已封装），裸文本调用会得到随机分数。
+
+---
+
+## 用户画像：14 模块 Schema
+
+抽取 LLM 的输出由 `profile_schema.py` 中 44 个字段引导，key 格式：
+- 单值字段（新值覆盖）：`module:field`，如 `identity:age`
+- 多值字段（同类追加）：`module:field:entity`，如 `nsfw:xp:bondage`
+
+| 模块 | 字段示例 | 特性 |
+|---|---|---|
+| `identity` | nickname / age / region / job / language | 基础身份 |
+| `personality` | trait / expression_style / social_tendency | 性格特征 |
+| `preference` | aesthetic / ai_interaction | 偏好 |
+| `behavior` | routine / messaging / conflict | 行为习惯 |
+| `emotional` | pattern / stressor / trigger | 情绪模式 |
+| `relationship` | romance / family / ai_relation | 关系背景 |
+| `timeline` | life_event / recent_event | 人生时间线 |
+| `goal` | long_term / short_term | 目标 |
+| `values` | value / moral_boundary | 价值观 |
+| `interest` | game / music / film / anime / book / sport | 兴趣（统一大类） |
+| `nsfw` | orientation / xp / content_pref / boundary | 成人偏好（sensitive=true） |
+| `conversation` | catchphrase / language_habit / meme | 语言习惯 |
+
+**默认可追加**：任何 2 段 key（`module:field`）不在单值白名单时，自动从 value 派生 entity 变成 3 段（如 `nsfw:xp` + "bondage" → `nsfw:xp:bondage`），多个偏好并存不覆盖。
+
+**单值白名单**（`SINGLE_VALUE_PREFIXES`）：`identity:age`、`identity:job`、`nsfw:orientation` 等天然只有一个值的字段，新值直接覆盖。
+
+---
+
+## 数据隔离：用户 × 角色
+
+所有表都带 `user_id` / `role_id` 独立列 + 组合索引，内部以 `session = user_id\x1frole_id` 为主键。
+
+```
+用户 U1 ──┬── 角色 A：独立 facts + relationship + episodes + chunks
+          └── 角色 B：完全独立的一套，互不干扰
+用户 U2 ────── 角色 A：又是独立的一套
+```
+
+**三重好处**：
+1. 记忆隔离正确（不同角色不串记忆）
+2. 检索候选集更小（只扫当前 session 的数据，毫秒级）
+3. 支持运营查询：某用户的全部角色 / 某角色的全部用户
+
+---
+
+## 向量数据库选型
+
+系统的向量检索层采用**仓储模式**（`app/store/base.py` 接口），可按需切换存储后端，无需改业务代码。
+
+### 当前支持后端对比
+
+| 后端 | 适用场景 | 向量存储 | ANN 检索 | 依赖 |
+|---|---|---|---|---|
+| `sqlite`（默认） | 本地开发 / 小规模 demo | float32 blob | 全量加载 + 内存三维打分 | 零依赖 |
+| `postgres` | 生产级 / 多并发 | pgvector `vector(dim)` 列 | HNSW 索引 KNN 预筛 + 三维重排 | pgvector ≥ 0.5 |
+
+```sql
+-- pgvector HNSW 索引（启动时自动建）
+CREATE INDEX idx_episodes_hnsw ON episodes
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+```
+
+### 其他向量数据库选型参考
+
+| 数据库 | 推荐理由 | 适合规模 | 接入方式 |
+|---|---|---|---|
+| **pgvector**（当前集成）| 与 PostgreSQL 共存，无额外运维，支持 HNSW/IVFFlat，事务内一致 | 百万向量以内 | `store/postgres_store.py` 已实现 |
+| **Qdrant** | 纯向量数据库，过滤检索强（支持 `user_id` payload 过滤），Rust 写性能好，有 Cloud 托管 | 千万级，多租户 | 扩展 `base.py` 实现 `QdrantStore` |
+| **Weaviate** | 自带多租户隔离（对应 user×role 模型），支持混合检索（BM25+向量），有 GraphQL 查询 | 千万级，SaaS 场景 | 扩展 `base.py` 实现 `WeaviateStore` |
+| **Milvus / Zilliz** | 高并发写入性能极强，分布式架构，适合全量用户画像向量化 | 亿级，高并发写 | 扩展 `base.py` 实现 `MilvusStore` |
+| **Chroma** | 轻量本地优先，API 简洁，适合快速原型 | 百万级以内 | 可替换 SQLite 后端 |
+
+> **本项目推荐**：中小规模（单机 < 500 万向量）直接用 **pgvector**，业务 DB 和向量 DB 合一，运维最简；千万级用户规模升级 **Qdrant**，其 payload filter 与本项目的 `user_id/role_id` 隔离模型天然契合。
+
+**Redis 热缓存**（`app/cache.py`）：`facts` / `relationship` 两条主链路热读，读穿透 + 写失效 + TTL 兜底。未配置或连接失败时自动降级为直查后端，绝不成为故障点。
+
+---
+
+## Embedding 与 Reranker 模型选型
+
+### Embedding 模型推荐
+
+| 模型 | 维度 | 语言支持 | 推荐理由 | 部署方式 |
+|---|---|---|---|---|
+| **Qwen3-Embedding-8B**（当前集成）| 4096（可变） | 中/英/日/韩/多语言 | MTEB 多语言 SOTA，支持可变输出维度（节省存储），无需翻译直接跨语言召回 | vLLM |
+| **Qwen3-Embedding-0.6B** | 1024 | 中/英/日/韩 | 轻量版，性能略低但资源消耗低 5-6 倍，适合低成本部署 | vLLM |
+| **text-embedding-3-large** | 3072 | 多语言 | OpenAI 托管，无需自部署，多语言质量高 | API 直调 |
+| **text-embedding-3-small** | 1536 | 多语言 | OpenAI 最低成本方案 | API 直调 |
+| **bge-m3** | 1024 | 100+ 语言 | 开源，支持稠密/稀疏/多粒度三路检索，MTEB 表现优秀 | vLLM / SentenceTransformers |
+
+> **部署命令（Qwen3-Embedding-8B）**：
+> ```bash
+> vllm serve Qwen/Qwen3-Embedding-8B \
+>   --task embed \
+>   --hf-overrides '{"is_causal": false}' \
+>   --port 8001
+> ```
+> 设置 `EMBED_BASE_URL=http://host:8001/v1` `EMBED_MODEL=Qwen/Qwen3-Embedding-8B` `EMBED_DIM=4096`
+
+### Reranker 模型推荐
+
+Reranker 接收「query + passage」对，输出 0~1 相关性分数，用于对粗召回结果精排，显著提升最终 top-K 质量。
+
+| 模型 | 参数量 | 推荐理由 | 部署方式 |
+|---|---|---|---|
+| **Qwen3-Reranker-8B**（当前集成）| 8B | 多语言 Rerank SOTA，中英日效果最佳，必须用官方 chat 模板（`rerank.py` 已封装） | vLLM |
+| **Qwen3-Reranker-0.6B** | 0.6B | 速度快成本低，准确率略低于 8B，中低并发场景可用 | vLLM |
+| **bge-reranker-v2-m3** | 568M | 开源，多语言，使用 cross-encoder 架构，SentenceTransformers 直接调用 | 本地加载 |
+| **BAAI/bge-reranker-large** | 560M | 中英双语质量高，推理速度快 | 本地加载 |
+| **Cohere Rerank 3** | 托管 | 无需自部署，多语言 API，延迟稳定 | API 直调 |
+
+> **注意**：Qwen3-Reranker 系列必须通过官方 chat 模板调用（以 yes/no token 概率作为分数），裸文本调用会得到随机结果。本项目的 `app/rerank.py` 已正确封装此逻辑，Reranker 不可用时自动回退到纯向量三维打分，不影响功能。
+
+> **部署命令（Qwen3-Reranker-8B）**：
+> ```bash
+> vllm serve Qwen/Qwen3-Reranker-8B \
+>   --task classify \
+>   --hf-overrides '{"is_causal": false, "classifier_from_token": ["yes","no"]}' \
+>   --port 8002
+> ```
+> 设置 `RERANK_BASE_URL=http://host:8002/v1` `RERANK_MODEL=Qwen/Qwen3-Reranker-8B`
+
+---
+
+## 快速开始
+
+### 1. 安装依赖
+
+```bash
+git clone https://github.com/bank010/role-memory.git
+cd role-memory
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. 配置环境变量
+
+```bash
+cp .env.example .env
+# 按需填写 .env（不填 CHAT_API_KEY 自动进 mock 模式，记忆机制照样可视化）
+```
+
+### 3. 启动服务
+
+```bash
+uvicorn app.main:app --reload --port 8011
+```
+
+打开 http://localhost:8011，点右上角 **「+ 新建角色」** 写一个角色提示词，就能开始聊了。
+
+### Mock 模式 vs 真实模式
+
+| | Mock 模式 | 真实模式 |
+|---|---|---|
+| **触发条件** | 不配 `CHAT_API_KEY` | 配置任意 OpenAI 兼容 key |
+| **回复质量** | 模板回复，较"傻" | 真实 LLM 生成 |
+| **记忆机制** | 正则抽取，完全可见 | LLM 抽取，质量更高 |
+| **向量** | 本地哈希（dim=256） | Qwen3-Embedding（dim=4096） |
+| **适用** | 看架构、跑通流程 | 体验真实效果 |
+
+---
+
+## 环境变量完整说明
+
+```bash
+# ── 对话端点（角色扮演回复）──────────────────────────────────
+CHAT_API_KEY=          # 必填（留空=mock 模式）
+CHAT_BASE_URL=https://api.openai.com/v1
+CHAT_MODEL=gpt-4o-mini
+
+# ── 抽取/摘要端点（建议与对话分开，用更稳定的模型）───────────
+# 留空则复用对话端点
+EXTRACT_API_KEY=
+EXTRACT_BASE_URL=https://api.deepseek.com/v1
+EXTRACT_MODEL=deepseek-chat
+EXTRACT_JSON_MODE=1    # 官方 DeepSeek/OpenAI 支持，开启提升 JSON 稳定性
+
+# ── 向量端点（Qwen3-Embedding via vLLM）─────────────────────
+# 留空则降级为本地哈希向量（功能完整，语义质量低）
+EMBED_API_KEY=vllm
+EMBED_BASE_URL=https://your-host/v1
+EMBED_MODEL=your_embedding_model_path
+EMBED_DIM=4096         # Qwen3-Embedding-8B=4096, text-embedding-3-small=1536
+
+# ── Rerank 精排（Qwen3-Reranker via vLLM）───────────────────
+# 留空则关闭，检索退回纯向量+三维打分
+RERANK_BASE_URL=https://your-host/v1
+RERANK_MODEL=your_reranker_model_path
+RERANK_API_KEY=vllm
+
+# ── 记忆参数 ────────────────────────────────────────────────
+WORKING_WINDOW=6       # 对话窗口保留最近多少轮原文
+PROCESS_EVERY=3        # 每累计多少轮触发一次记忆加工
+RETRIEVE_TOP_K=4       # 情节/逐字召回最终 top-K 条数
+RECENCY_DECAY=0.02     # 新近度衰减系数（越大越偏向最近）
+MAX_EPISODES=200       # 情节库上限（超限按重要度×新近度淘汰）
+MAX_CHUNKS=500         # 逐字库上限（超限淘汰最旧）
+FACT_MERGE_THRESHOLD=0.86  # 事实语义合并阈值（同类实体相似度超此值则合并）
+
+# ── 开关 ────────────────────────────────────────────────────
+NSFW_ENABLED=1         # 敏感画像/事件提取与注入总开关
+NORMALIZE_ENABLED=0    # 多语言归一化（用 Qwen3-Embedding 时关闭）
+
+# ── 存储后端 ─────────────────────────────────────────────────
+STORE_BACKEND=sqlite   # sqlite | postgres
+PG_DSN=postgresql://memory:memory@localhost:5432/role_memory
+
+# ── Redis 热缓存 ─────────────────────────────────────────────
+# REDIS_URL=redis://localhost:6379/0
+CACHE_TTL=600
+
+# ── CORS（前后端分离）────────────────────────────────────────
+# 留空=放行所有来源；生产建议填前端域名白名单
+# CORS_ORIGINS=https://app.yourdomain.com,http://localhost:3000
+```
+
+---
+
+## 生产级部署
+
+### Step 1：存储层（Postgres + pgvector + Redis）
+
+```bash
+docker compose up -d   # 一键拉起 pgvector + redis
+```
+
+在 `.env` 中修改：
+
+```bash
+STORE_BACKEND=postgres
+PG_DSN=postgresql://memory:memory@localhost:5432/role_memory
+REDIS_URL=redis://localhost:6379/0
+```
+
+业务代码零改动，启动日志打印 `store=postgres | cache=True`。
+
+### Step 2：向量模型（Qwen3-Embedding-8B，vLLM）
+
+```bash
+vllm serve Qwen/Qwen3-Embedding-8B \
+  --task embed \
+  --hf-overrides '{"is_causal": false}' \
+  --port 8001
+```
+
+```bash
+# .env
+EMBED_BASE_URL=http://localhost:8001/v1
+EMBED_MODEL=Qwen/Qwen3-Embedding-8B
+EMBED_API_KEY=vllm
+EMBED_DIM=4096
+```
+
+> 不想自部署？替换为 `EMBED_BASE_URL=https://api.openai.com/v1` + `EMBED_MODEL=text-embedding-3-large` 即可，无需改代码。
+
+### Step 3：Reranker 精排（Qwen3-Reranker-8B，vLLM）
+
+```bash
+vllm serve Qwen/Qwen3-Reranker-8B \
+  --task classify \
+  --hf-overrides '{"is_causal": false, "classifier_from_token": ["yes","no"]}' \
+  --port 8002
+```
+
+```bash
+# .env
+RERANK_BASE_URL=http://localhost:8002/v1
+RERANK_MODEL=Qwen/Qwen3-Reranker-8B
+RERANK_API_KEY=vllm
+```
+
+> 不部署 Reranker 时留空即可，系统自动回退到三维打分排序，功能完整。
+
+### Step 4：启动服务
+
+```bash
+uvicorn app.main:app --workers 4 --port 8011
+```
+
+---
+
+## API 接口
+
+完整接口文档见 [`app/API.md`](app/API.md)，以下为速查表：
+
+| 方法 | 端点 | 说明 |
+|---|---|---|
+| `POST` | `/api/chat` | 发送消息，获取 AI 回复（后台异步触发记忆加工） |
+| `GET` | `/api/memory` | 查询用户画像 / 情节库 / 关系状态 |
+| `GET` | `/api/history` | 获取最近 N 轮对话记录（刷新恢复用） |
+| `POST` | `/api/reprocess` | 重置加工进度，从头重新抽取所有记忆 |
+| `POST` | `/api/reset` | 清空该会话全部记忆（不可逆） |
+| `GET` | `/api/health` | 健康检查，返回各后端/开关状态 |
+
+---
+
+## 目录结构
+
+```
+role-memory/
+├── app/
+│   ├── main.py              # FastAPI 入口，6 个 API 端点 + CORS + 后台任务管理
+│   ├── config.py            # 集中配置（所有环境变量的读取与默认值）
+│   ├── schemas.py           # Pydantic 请求体模型
+│   ├── session.py           # (user_id, role_id) ↔ session 组装/拆解
+│   ├── llm.py               # LLM 客户端（对话+抽取双端点，OpenAI 兼容 + mock）
+│   ├── embeddings.py        # 向量化（Qwen3-Embedding + 本地哈希降级）
+│   ├── rerank.py            # Qwen3-Reranker 精排（封装官方 chat 模板）
+│   ├── normalizer.py        # 多语言归一化（可选，默认关闭）
+│   ├── personas.py          # L0 人设（兜底，角色由调用方通过 persona_text 管理）
+│   ├── cache.py             # Redis 热缓存（读穿透/写失效/优雅降级）
+│   ├── API.md               # 完整服务端接口文档
+│   ├── store/
+│   │   ├── base.py          # 存储后端抽象接口（ABC）
+│   │   ├── sqlite_store.py  # SQLite 实现（默认，零依赖）
+│   │   ├── postgres_store.py# PostgreSQL + pgvector 实现（生产级）
+│   │   └── __init__.py      # 工厂：按 STORE_BACKEND 选实现
+│   └── memory/
+│       ├── profile_schema.py# 14 模块画像 Schema（多值/敏感/单值白名单定义）
+│       ├── stores.py        # 记忆编排层（向量化/去重/语义合并/缓存/淘汰）
+│       ├── retrieval.py     # 三维打分 + 逐字混合检索 + Reranker 精排
+│       ├── assembler.py     # 上下文拼装（L0~L3 + 占位符填充 + 剧情引导）
+│       └── pipeline.py      # 异步记忆加工管线（抽取/归纳/关系/摘要/反思 + session 锁）
+├── static/
+│   ├── index.html           # 可视化 Demo 页面
+│   ├── app.js               # 前端逻辑（角色管理 localStorage + 记忆面板）
+│   └── style.css            # 深色主题样式
+├── .env.example             # 环境变量模板（含所有字段说明）
+├── docker-compose.yml       # 一键拉起 pgvector + Redis
+├── requirements.txt         # Python 依赖
+└── pytest.ini               # 测试配置
 ```
