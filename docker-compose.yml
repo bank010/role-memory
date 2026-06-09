@@ -1,0 +1,31 @@
+# 一键拉起生产级存储依赖：PostgreSQL(pgvector) + Redis
+#   docker compose up -d
+# 然后在 .env 里设置：
+#   STORE_BACKEND=postgres
+#   PG_DSN=postgresql://memory:memory@localhost:5432/role_memory
+#   REDIS_URL=redis://localhost:6379/0
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: memory
+      POSTGRES_DB: role_memory
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory -d role_memory"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "60", "1"]
+
+volumes:
+  pgdata:

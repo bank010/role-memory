@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>角色扮演记忆系统 · Demo</title>
+  <link rel="stylesheet" href="/static/style.css?v=2" />
+</head>
+<body>
+  <header>
+    <div class="title">
+      <h1>角色扮演记忆系统 <span class="tag" id="mode-tag">…</span></h1>
+      <p class="sub">左边聊天，右边实时看「记忆」是怎么长出来 / 被召回的</p>
+    </div>
+    <div class="controls">
+      <label>用户ID
+        <input id="user-id" type="text" placeholder="user_xxx(自动)" style="width:110px" />
+      </label>
+      <label>角色
+        <select id="persona"></select>
+      </label>
+      <button id="new-role-btn" class="ghost" title="新建一个角色">＋ 新建角色</button>
+      <button id="edit-role-btn" class="ghost" title="编辑当前角色提示词">✎ 编辑角色</button>
+      <label>{{user}}
+        <input id="user-name" type="text" placeholder="用户名(可空)" />
+      </label>
+      <button id="reprocess-btn" class="ghost">重新加工记忆</button>
+      <button id="reset-btn" class="ghost">重置记忆</button>
+    </div>
+  </header>
+
+  <!-- 角色提示词编辑弹窗 -->
+  <div id="role-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h3 id="role-modal-title">新建角色</h3>
+      <label class="modal-field">角色名 <span class="muted">（用于替换提示词里的 {{char}}）</span>
+        <input id="role-char-name" type="text" placeholder="如 Vivica" />
+      </label>
+      <label class="modal-field">角色提示词 / 系统设定
+        <textarea id="role-prompt" rows="14" placeholder="在这里写角色的人设、背景、说话风格…&#10;可使用 {{char}} 代表角色、{{user}} 代表用户。"></textarea>
+      </label>
+      <div class="modal-actions">
+        <button id="role-delete-btn" class="ghost danger" hidden>删除此角色</button>
+        <span class="spacer"></span>
+        <button id="role-cancel-btn" class="ghost">取消</button>
+        <button id="role-save-btn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <main>
+    <!-- 左：聊天 -->
+    <section class="chat-pane">
+      <div id="messages" class="messages"></div>
+      <div class="composer">
+        <textarea id="input" placeholder="说点什么…（试试告诉它你的名字、喜好、约定一件事，多聊几轮再回头提）" rows="2"></textarea>
+        <button id="send-btn">发送</button>
+      </div>
+      <p class="hint">提示：每 <b id="pe">3</b> 轮触发一次后台记忆加工。多聊几轮，右侧画像/情节/关系会陆续出现。</p>
+    </section>
+
+    <!-- 右：记忆面板 -->
+    <aside class="mem-pane">
+      <div class="card">
+        <h3>关系 / 情绪状态 <small>L1 常驻</small></h3>
+        <div id="relationship" class="rel"></div>
+      </div>
+
+      <div class="card">
+        <h3>用户画像（语义记忆）<small>L1 结构化事实</small></h3>
+        <div id="facts" class="facts empty">还没有抽取到事实</div>
+      </div>
+
+      <div class="card">
+        <h3>本轮召回的情节 <small>L3 情节 · relevance×recency×importance 三维打分</small></h3>
+        <div id="retrieved" class="retrieved empty">本轮未召回</div>
+      </div>
+
+      <div class="card">
+        <h3>本轮逐字召回 <small>L3 逐字 · 向量 + 关键词混合，管精确细节</small></h3>
+        <div id="verbatim" class="retrieved empty">本轮未召回原话</div>
+      </div>
+
+      <div class="card">
+        <h3>情节记忆库（全部）<small>L3 情节库 · 事件+向量，含 [insight] 洞察</small></h3>
+        <div id="episodes" class="episodes empty">还没有情节记忆</div>
+      </div>
+
+      <div class="card">
+        <h3>本轮注入 LLM 的 System Prompt <small>点击展开查看 L0~L3 完整拼装</small></h3>
+        <details>
+          <summary>L0 人设 · L1 事实/关系/摘要 · L2 对话窗口(messages) · L3 情节+逐字召回</summary>
+          <pre id="sysprompt" class="sysprompt"></pre>
+        </details>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js?v=4"></script>
+</body>
+</html>
