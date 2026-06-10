@@ -14,8 +14,7 @@ import re
 import time
 from typing import Dict, List, Tuple
 
-from app import config, embeddings, normalizer
-from app.memory import retrieval, stores
+from . import config, embeddings, normalizer, retrieval, stores
 
 _CHAR_PAT = re.compile(r"\{\{\s*char\s*\}\}", re.I)
 _USER_PAT = re.compile(r"\{\{\s*user\s*\}\}", re.I)

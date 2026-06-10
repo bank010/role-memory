@@ -13,7 +13,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from app.store.base import BaseStore
+from .base import BaseStore
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS turns (

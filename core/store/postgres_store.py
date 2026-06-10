@@ -16,7 +16,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from app.store.base import BaseStore
+from .base import BaseStore
 
 log = logging.getLogger("store.postgres")
 

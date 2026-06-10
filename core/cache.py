@@ -18,7 +18,7 @@ import json
 import logging
 from typing import Awaitable, Callable, Optional
 
-from app import config
+from . import config
 
 log = logging.getLogger("cache")
 

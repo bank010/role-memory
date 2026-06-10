@@ -13,7 +13,7 @@ from typing import List
 import httpx
 import numpy as np
 
-from app import config
+from . import config
 
 log = logging.getLogger("embeddings")
 
@@ -80,7 +80,7 @@ async def embed_query(text: str) -> np.ndarray:
     重复/相同问法直接命中缓存，省掉一次远程 embedding 调用（几十毫秒级），
     是在线检索做到毫秒级的关键一环。写路径（记忆入库）仍走 embed()。
     """
-    from app import cache
+    from . import cache
 
     cached_blob = await cache.get_embedding(config.EMBED_MODEL, text)
     if cached_blob is not None:
