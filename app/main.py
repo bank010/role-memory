@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -24,14 +26,19 @@ _bg_tasks: set = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    stores.init()
+    await stores.init()
     log.info("启动完成 | mock=%s | chat=%s @ %s | embed_real=%s | rerank=%s | store=%s | cache=%s",
              config.MOCK_MODE, config.CHAT_MODEL, config.CHAT_BASE_URL, config.EMBED_REAL,
              rerank.enabled(), config.STORE_BACKEND, cache.enabled())
     yield
+    # 优雅停机：先排空在途的后台索引/加工任务，再关闭各客户端与存储
+    if _bg_tasks:
+        await asyncio.gather(*list(_bg_tasks), return_exceptions=True)
     await llm.aclose()
     await embeddings.aclose()
     await rerank.aclose()
+    await cache.aclose()
+    await stores.close()
 
 
 app = FastAPI(title="角色扮演记忆系统 Demo", lifespan=lifespan)
@@ -63,6 +70,19 @@ async def health():
             "personas": personas.list_personas()}
 
 
+# 聊天 UI 按纯文本渲染：模型习惯性输出的 markdown 强调/标题符号要剥掉（保留文字内容）。
+# prompt 里已禁用 markdown，这里是硬兜底——角色扮演模型的 *action* 习惯单靠提示词拦不全。
+_MD_EMPHASIS = re.compile(r"\*{1,3}([^*\n]+?)\*{1,3}")
+_MD_HEADER = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+
+
+def _strip_markdown(text: str) -> str:
+    if not text or ("*" not in text and "#" not in text):
+        return text
+    text = _MD_EMPHASIS.sub(r"\1", text)
+    return _MD_HEADER.sub("", text)
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     # 角色提示词优先用前端直传的 persona_text；没有则回退到兜底人设
@@ -74,14 +94,17 @@ async def chat(req: ChatRequest):
     role_id = req.role_id or req.persona_id
     session, user_id, role_id = session_mod.make_session(req.user_id, role_id, req.session)
 
+    t0 = time.perf_counter()
+
     # 1) 读路径（在线，快）：拼装上下文
     messages, debug = await assembler.build_context(
         session, persona, req.message, char_name, req.user_name
     )
+    t_ctx = time.perf_counter()
 
     # 2) 生成回复（LLM 端点可能超时/报错：返回结构化 JSON 错误，前端能正常解析，不再裸 500）
     try:
-        reply = await llm.chat(messages)
+        reply = _strip_markdown(await llm.chat(messages))
     except Exception as e:
         log.error("LLM 对话生成失败 session=%s err=%r", session, e)
         return JSONResponse(
@@ -92,7 +115,7 @@ async def chat(req: ChatRequest):
         )
 
     # 3) 写路径（落日志立即返回；逐字索引 + 记忆加工后台异步，不阻塞）
-    turn = stores.append_turn(session, req.message, reply, user_id, role_id)
+    turn = await stores.append_turn(session, req.message, reply, user_id, role_id)
 
     # 记忆直接用真实名字存储：用前端传入的名字（user_name 未传则用 build_context 解析出的）
     mem_user_name = (req.user_name or "").strip() or debug.get("user_name") or ""
@@ -114,6 +137,14 @@ async def chat(req: ChatRequest):
     _bg_tasks.add(t := asyncio.create_task(_index_and_process()))
     t.add_done_callback(_bg_tasks.discard)
 
+    # 整链路分段计时：context = 记忆读路径（embed+召回+拼装），llm = 模型生成，
+    # 前端按气泡展示，方便定位"慢在哪"
+    t_end = time.perf_counter()
+    timing = dict(debug.get("timing_ms") or {})
+    timing["context"] = round((t_ctx - t0) * 1000, 1)
+    timing["llm"] = round((t_end - t_ctx) * 1000, 1)
+    timing["total"] = round((t_end - t0) * 1000, 1)
+
     return JSONResponse({
         "reply": reply,
         "turn": turn,
@@ -124,6 +155,7 @@ async def chat(req: ChatRequest):
             "relationship": debug["relationship"],
             "window_turns": debug["window_turns"],
             "system_prompt": debug["system_prompt"],
+            "timing_ms": timing,
         },
     })
 
@@ -131,16 +163,22 @@ async def chat(req: ChatRequest):
 @app.get("/api/memory")
 async def memory(session: str = None, user_id: str = None, role_id: str = None):
     session, _, _ = session_mod.make_session(user_id, role_id, session)
-    eps = stores.all_episodes(session)
+    facts, eps, rel, mt, lp = await asyncio.gather(
+        stores.all_facts(session),
+        stores.all_episodes(session),
+        stores.get_relationship(session),
+        stores.max_turn(session),
+        stores.get_last_processed(session),
+    )
     for e in eps:
         e.pop("vec", None)
     eps.sort(key=lambda x: x["turn"], reverse=True)
     return {
-        "facts": stores.all_facts(session),
+        "facts": facts,
         "episodes": eps,
-        "relationship": stores.get_relationship(session),
-        "max_turn": stores.max_turn(session),
-        "last_processed": stores.get_last_processed(session),
+        "relationship": rel,
+        "max_turn": mt,
+        "last_processed": lp,
     }
 
 
@@ -150,25 +188,26 @@ async def reprocess(req: ResetRequest):
     用于 prompt 改动后补救已有 session，或手动触发补全漏掉的记忆。"""
     session, user_id, role_id = session_mod.make_session(req.user_id, req.role_id, req.session)
     char_name = (req.char_name or "").strip() or personas.get_char_name(req.role_id)
-    user_name = (req.user_name or "").strip() or assembler.memory_user_name(stores.all_facts(session))
-    stores.set_last_processed(session, 0)
+    user_name = (req.user_name or "").strip() \
+        or assembler.memory_user_name(await stores.all_facts(session))
+    await stores.set_last_processed(session, 0)
     await pipeline.maybe_process(session, user_id, role_id, char_name, user_name)
-    return {"ok": True, "max_turn": stores.max_turn(session),
-            "last_processed": stores.get_last_processed(session)}
+    return {"ok": True, "max_turn": await stores.max_turn(session),
+            "last_processed": await stores.get_last_processed(session)}
 
 
 @app.get("/api/history")
 async def history(session: str = None, user_id: str = None, role_id: str = None, n: int = 40):
     """返回最近 n 轮对话，供前端刷新后恢复聊天记录。"""
     session, _, _ = session_mod.make_session(user_id, role_id, session)
-    turns = stores.recent_turns(session, n)
+    turns = await stores.recent_turns(session, n)
     return {"turns": turns}
 
 
 @app.post("/api/reset")
 async def reset(req: ResetRequest):
     session, _, _ = session_mod.make_session(req.user_id, req.role_id, req.session)
-    stores.reset_session(session)
+    await stores.reset_session(session)
     return {"ok": True}
 
 

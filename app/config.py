@@ -48,6 +48,9 @@ RERANK_API_KEY = _get("RERANK_API_KEY", default="vllm")
 RERANK_ENABLED = bool(RERANK_BASE_URL and RERANK_MODEL)
 # 粗召回候选倍数：实际取 top_k * 此值 条送入精排
 RERANK_CANDIDATE_MULT = int(os.getenv("RERANK_CANDIDATE_MULT", "4"))
+# 精排延迟预算（毫秒）：超时立即降级回三维打分/向量排序，保证读路径不被精排拖垮。
+# 0 = 不限制（不推荐生产使用）。
+RERANK_TIMEOUT_MS = int(os.getenv("RERANK_TIMEOUT_MS", "300"))
 
 # 没有 chat key 就进入 mock 模式：规则抽取 + 模板回复
 MOCK_MODE = not bool(CHAT_API_KEY)
@@ -70,17 +73,33 @@ NSFW_ENABLED = os.getenv("NSFW_ENABLED", "1") == "1"
 
 # ---- 记忆参数 ----
 WORKING_WINDOW = int(os.getenv("WORKING_WINDOW", "6"))
-PROCESS_EVERY = int(os.getenv("PROCESS_EVERY", "3"))
+PROCESS_EVERY = int(os.getenv("PROCESS_EVERY", "5"))
 RETRIEVE_TOP_K = int(os.getenv("RETRIEVE_TOP_K", "4"))
 RECENCY_DECAY = float(os.getenv("RECENCY_DECAY", "0.02"))
+# 逐字召回的 KNN 候选条数（postgres 预筛；候选内再做向量+词法混合重排）
+VERBATIM_CANDIDATES = int(os.getenv("VERBATIM_CANDIDATES", "64"))
 
 # 三维打分权重：relevance / recency / importance
 SCORE_WEIGHTS = (0.55, 0.20, 0.25)
 
 # ---- 记忆体量上限（遗忘/淘汰）----
-# 超过上限时：情节按"重要度 × 新近度"打分淘汰最低分；chunk 按时间淘汰最旧
+# 超过上限时：情节按"重要度 × 新近度"打分淘汰最低分；chunk 按时间淘汰最旧；
+# facts 按"置信度 × 新近度"淘汰最低分（单值身份类字段不淘汰）
 MAX_EPISODES = int(os.getenv("MAX_EPISODES", "200"))
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "500"))
+MAX_FACTS = int(os.getenv("MAX_FACTS", "150"))
+
+# facts 注入上限：超过此数时按"与当前 query 相关性 + 置信度 + 新近度"选 top-K 注入，
+# 防止重度用户的画像撑爆 system prompt（token 成本 + 注意力稀释）
+FACTS_INJECT_TOP_K = int(os.getenv("FACTS_INJECT_TOP_K", "30"))
+
+# 真实时间衰减（按天）：召回打分在 turn 衰减外再乘 exp(-此值 × 距今天数)，
+# 用户离开两周回来，旧记忆不再"鲜活如昨"
+RECENCY_TIME_DECAY = float(os.getenv("RECENCY_TIME_DECAY", "0.01"))
+
+# 检索 query 增强：用户消息短于此字符数时（"那它呢？"这类指代），
+# 拼上一轮对话一起做检索，提升指代场景的召回
+QUERY_AUGMENT_MAX_LEN = int(os.getenv("QUERY_AUGMENT_MAX_LEN", "24"))
 
 # 事实语义合并阈值：同类别下，实体向量相似度 >= 此值视为"同一条目"，更新而非新增。
 # 偏高以避免误合并（如 cilantro 与 shrimp 不应合并）。
@@ -92,11 +111,16 @@ FACT_MERGE_THRESHOLD = float(os.getenv("FACT_MERGE_THRESHOLD", "0.86"))
 STORE_BACKEND = _get("STORE_BACKEND", default="sqlite").lower()
 DB_PATH = BASE_DIR / "memory.db"
 PG_DSN = _get("PG_DSN", "DATABASE_URL", default="postgresql://localhost:5432/role_memory")
+# Postgres 异步连接池大小（百万用户级部署按实例数 × 池大小规划 PG max_connections / PgBouncer）
+PG_POOL_MIN = int(os.getenv("PG_POOL_MIN", "2"))
+PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "20"))
 
 # ---- Redis 热缓存（留空则关闭，自动降级为直查后端）----
 REDIS_URL = _get("REDIS_URL")
 CACHE_ENABLED = bool(REDIS_URL)
 CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))
+# 查询 embedding 缓存 TTL（读路径毫秒级的关键之一：重复/相近问法免一次 embed 调用）
+EMBED_CACHE_TTL = int(os.getenv("EMBED_CACHE_TTL", "3600"))
 
 # ---- CORS（前后端分离）----
 # 逗号分隔的前端域名白名单；留空则放行所有来源（"*"）。

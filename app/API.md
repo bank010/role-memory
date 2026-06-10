@@ -388,7 +388,7 @@ curl http://localhost:8011/api/health
 记忆加工（事实抽取 + 情节归纳 + 关系更新 + 滚动摘要）在后台**异步**执行，触发条件：
 
 ```
-当前轮次(max_turn) - 上次加工轮次(last_processed) >= PROCESS_EVERY(默认 3)
+当前轮次(max_turn) - 上次加工轮次(last_processed) >= PROCESS_EVERY(默认 5)
 ```
 
 加工期间对话正常进行，加工结果下一轮起生效。可通过 `GET /api/memory` 的 `last_processed` 字段判断加工进度。

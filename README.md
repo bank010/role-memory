@@ -9,9 +9,12 @@
 
 ![Demo 截图：左侧对话界面，右侧实时展示情节记忆面板（重要度/情绪/轮次标签）](image/image.png)
 
-> 左侧为对话主界面，右侧**情节记忆（全部）**面板实时展示已抽取的情节记忆条目，每条附带重要度、情绪标签、所在轮次，以及 Insight（反思洞察）注释。底部状态栏显示「每 3 轮触发记忆加工一次，左侧面板/关系/状态在加工后更新」。
+> 左侧为对话主界面，右侧**情节记忆（全部）**面板实时展示已抽取的情节记忆条目，每条附带重要度、情绪标签、所在轮次，以及 Insight（反思洞察）注释。底部状态栏显示「每 5 轮触发记忆压缩一次，左侧面板/关系/状态在加工后更新」。
 
 ---
+
+> 📊 **想快速看懂每条链路？** 全部流程图见 [docs/FLOW.md](docs/FLOW.md)：
+> 系统总览 / 一轮对话全链路 / 读路径拼装 / 两路召回 / 压缩管线 / facts·episode 写入 / 两级锁 / 遗忘治理。
 
 ## 目录
 
@@ -39,15 +42,23 @@
 |---|---|
 | **分层记忆模型** | L0 人设 / L1 画像+关系 / L2 情节 / L3 逐字原话，各层独立演进 |
 | **用户 × 角色隔离** | `(user_id, role_id)` 完全隔离，1:N / N:N，独立画像、关系、事件 |
-| **多语言原生** | Qwen3-Embedding 直接对原文向量化，无需翻译，中/英/日跨语言召回 |
-| **两阶段检索** | 向量粗召回 → Qwen3-Reranker 精排，显著提升相关性 |
-| **14 模块结构化画像** | 覆盖身份/性格/兴趣/NSFW 等，默认可追加（同类多值并存） |
+| **多语言原生** | 记忆直接用用户的语言存储（不翻译，省 token、小语种不失真）；Qwen3-Embedding 直接对原文向量化；词法检索语言无关（空格分词语言按词、中/日/泰按字符 bigram） |
+| **毫秒级读路径** | query 单次 embed（带 Redis 缓存）+ 各路记忆并行 gather + KNN 候选预筛 + 精排延迟预算，debug 带分段计时 |
+| **两阶段检索** | 向量粗召回 → Qwen3-Reranker 精排；精排有严格延迟预算（默认 300ms），超时降级绝不拖垮读路径 |
+| **全异步存储** | Postgres 走 AsyncConnectionPool 异步连接池，episodes/chunks 双 HNSW 索引原生 KNN；turn 取号原子化（并发安全） |
+| **14 模块结构化画像** | 覆盖身份/性格/兴趣/NSFW 等，默认可追加（同类多值并存）；entity slug 多语言安全（unicode 分词 + hash 兜底，非英文 value 不互相覆盖） |
+| **画像体量治理** | 超 `MAX_FACTS` 按"置信度×新近度"淘汰（核心身份不淘汰）；注入超 `FACTS_INJECT_TOP_K` 时按"query 相关性+置信度+新近度"裁剪，重度用户不撑爆 prompt |
+| **矛盾事实处理** | 抽取 prompt 强制同 key 更新 + 支持 `op:delete` 撤回（用户改口即遗忘），不留两条互相矛盾的画像 |
+| **真实时间感知** | 召回打分叠加按天的时间衰减；注入标签用自然时间（"3 days ago" 而非 "5 turns ago"），离开两周回来角色能自然感知 |
+| **指代检索增强** | 短消息（"后来呢？"）自动拼上一轮对话做检索，向量/词法两路都有语境信号 |
+| **分层摘要** | 滚动摘要每 ~10 个加工周期归档为 `[chapter]` 情节（可向量召回），长期剧情不被反复压缩丢失 |
+| **情节合并不丢信息** | 语义去重命中时保留更详细的事件文本（连同新向量），合并只增不减 |
 | **真名存储** | 情节/画像/摘要直接用真实角色名/用户名写入，自然可读 |
 | **NSFW 分级** | `sensitive` 标记隔离，`NSFW_ENABLED` 总开关控制提取与注入 |
 | **主动推进剧情** | System prompt 内嵌叙事引导，AI 主动制造情节、不被动应答 |
-| **并发安全** | session 级异步加工锁，同会话串行；加工失败不推进游标，下次重试不丢记忆 |
+| **并发安全** | 进程内 session 级加工锁 + Redis 分布式锁（多 worker/多实例互斥）；加工失败不推进游标，下次重试不丢记忆 |
 | **可插拔存储** | SQLite（零依赖）/ PostgreSQL + pgvector + HNSW（生产级），一行配置切换 |
-| **Redis 热缓存** | facts/relationship 热读缓存，未配置时自动降级，绝不成为故障点 |
+| **Redis 热缓存** | facts/relationship 热读 + 查询 embedding 缓存，未配置时自动降级，绝不成为故障点 |
 | **CORS 支持** | 内置跨域中间件，前后端分离开箱即用 |
 
 ---
@@ -105,12 +116,15 @@
 | L3 | 逐字记忆 | 每轮原话，管精确细节 | `chunks` | ✅ | 每轮写入 |
 | — | 真相源 | 原始对话日志（append-only，可重建一切） | `turns` | — | 每轮写入 |
 
-### 读路径（在线，每轮）
+### 读路径（在线，每轮，毫秒级预算）
 
 ```
-用户消息 → query 向量化
-         → L2 情节粗召回(TopK×4) → Reranker 精排 → TopK
-         → L3 逐字粗召回          → Reranker 精排 → TopK
+用户消息 → query 向量化【一次，带 Redis 缓存】
+         → 并行 gather：
+             L1 facts + relationship（Redis 读穿透）
+             L2 情节 KNN 粗召回(TopK×4) → Reranker 精排(延迟预算内) → TopK
+             L3 逐字 KNN 粗召回(top-64) → 向量+词法混合重排 → 精排 → TopK
+             工作窗口 recent_turns
          → 拼装 system prompt（L0+L1+L2+L3+对话窗口）
          → LLM 生成回复
 ```
@@ -121,10 +135,11 @@
 对话结束 → turns 落库（同步，立即）
          → create_task（异步，不等待）：
              逐字向量化 index_chunk（每轮）
-             maybe_process（差值 ≥ PROCESS_EVERY 才触发）：
-               LLM 抽取 facts + episode + relationship_delta
-               LLM 更新滚动摘要
-               LLM 反思洞察（更长周期）
+             maybe_process（差值 ≥ PROCESS_EVERY=5 才触发压缩）：
+               ┌ LLM 抽取 facts + episode + relationship_delta ┐
+               └ LLM 更新滚动摘要                              ┘ ← 两路并行
+               关系 delta + 新摘要 合并为一次写入
+               LLM 反思洞察 / 章节归档（更长周期，按边界穿越触发）
                last_processed 游标推进
 ```
 
@@ -147,12 +162,11 @@
     ▼ [写路径，后台异步]
 ⑦ turns 表写入本轮原话
 ⑧ user/assistant 各 embed 一条 → chunks 表
-⑨ max_turn - last_processed ≥ 3 ？
-      是 → 加工锁 → LLM 抽取 JSON：
-              facts（用户稳定偏好） → facts 表
-              episode（本批事件）  → episodes 表
-              relationship delta  → relationship 表
-           LLM 更新滚动摘要
+⑨ max_turn - last_processed ≥ 5 ？
+      是 → 加工锁 → 并行两路 LLM：
+              抽取 JSON ──→ facts（用户稳定偏好） → facts 表
+              │             episode（本批事件）  → episodes 表
+              滚动摘要 ──→ 与 relationship delta 合并一次写入
            last_processed = max_turn（成功才推进）
       否 → 结束
 ```
@@ -170,30 +184,36 @@ CREATE TABLE meta (
 );
 ```
 
-触发判断（两级检查，防并发重复加工）：
+触发判断（两级锁 + 两级检查，防并发重复加工）：
 
 ```python
 # 锁外预检（避免无谓抢锁）
 if max_turn - last_processed < PROCESS_EVERY:
     return
 
-async with session_lock:  # session 级锁，不同会话互不阻塞
-    # 锁内二次确认（可能已被其他协程加工）
+async with session_lock:                  # 进程内锁：同进程并发请求串行
+    token = await cache.acquire_lock(...)  # Redis 分布式锁：多 worker/多实例互斥
+    if token is None:
+        return  # 别的实例正在加工，本次放弃（下一轮触发会补上）
+    # 锁内二次确认（可能已被其他协程/实例加工）
     if max_turn - last_processed < PROCESS_EVERY:
         return
     await _process(...)
     last_processed = max_turn  # 成功才推进，失败下次重试
 ```
 
-**时间轴示例**（PROCESS_EVERY=3）：
+> Redis 未配置时分布式锁自动退化为仅进程内锁（单实例部署不受影响）。
+> 多 worker（`--workers 4`）或多实例部署务必配置 `REDIS_URL`。
+
+**时间轴示例**（PROCESS_EVERY=5）：
 
 | 轮次 | last_processed | 差值 | 是否加工 |
 |---|---|---|---|
 | 1 | 0 | 1 | ❌ |
-| 2 | 0 | 2 | ❌ |
-| **3** | 0 | 3 | ✅ → 推进到 3 |
-| 4 | 3 | 1 | ❌ |
-| **6** | 3 | 3 | ✅ → 推进到 6 |
+| 4 | 0 | 4 | ❌ |
+| **5** | 0 | 5 | ✅ → 推进到 5 |
+| 6 | 5 | 1 | ❌ |
+| **10** | 5 | 5 | ✅ → 推进到 10 |
 
 ---
 
@@ -211,14 +231,23 @@ score = w_r × relevance + w_t × recency + w_i × importance
 ### 两阶段检索流程
 
 ```
-query → embed → 向量粗召回 top-(K×4)
+query → embed（Redis 缓存命中则免远程调用） → 向量粗召回 top-(K×4)
               → RERANK_ENABLED ?
-                  是 → Qwen3-Reranker 精排 → top-K
-                  否 → 三维打分排序    → top-K
+                  是 → Qwen3-Reranker 精排（RERANK_TIMEOUT_MS 预算内）→ top-K
+                  否 / 超时 / 失败 → 三维打分排序 → top-K
               → 注入 system prompt
 ```
 
 Reranker 使用 Qwen3 官方 chat 模板（`rerank.py` 已封装），裸文本调用会得到随机分数。
+精排有严格延迟预算（默认 300ms）：在线读路径是毫秒级 SLO，超时立即降级回粗排顺序，
+一次网络抖动不会把整条读路径拖到秒级。
+
+### 多语言词法检索
+
+逐字混合检索的词法部分语言无关：
+- 空格分词语言（英/俄/韩/阿拉伯等）：按词匹配，整词权重 2.0（强信号：名字、专名）；
+- 无空格语言（中文/日文假名/泰文）：按字符 bigram 匹配，bigram 权重 2.0，单字低权重；
+- 中文虚词、日文助词等高频停用字权重压到最低，不产生噪声命中。
 
 ---
 
@@ -411,12 +440,14 @@ EMBED_DIM=4096         # Qwen3-Embedding-8B=4096, text-embedding-3-small=1536
 RERANK_BASE_URL=https://your-host/v1
 RERANK_MODEL=your_reranker_model_path
 RERANK_API_KEY=vllm
+RERANK_TIMEOUT_MS=300  # 精排延迟预算，超时降级回粗排顺序（0=不限制）
 
 # ── 记忆参数 ────────────────────────────────────────────────
 WORKING_WINDOW=6       # 对话窗口保留最近多少轮原文
-PROCESS_EVERY=3        # 每累计多少轮触发一次记忆加工
+PROCESS_EVERY=5        # 每累计多少轮触发一次记忆压缩（后台异步，抽取/摘要并行）
 RETRIEVE_TOP_K=4       # 情节/逐字召回最终 top-K 条数
 RECENCY_DECAY=0.02     # 新近度衰减系数（越大越偏向最近）
+VERBATIM_CANDIDATES=64 # 逐字召回 KNN 候选条数（postgres 预筛）
 MAX_EPISODES=200       # 情节库上限（超限按重要度×新近度淘汰）
 MAX_CHUNKS=500         # 逐字库上限（超限淘汰最旧）
 FACT_MERGE_THRESHOLD=0.86  # 事实语义合并阈值（同类实体相似度超此值则合并）
@@ -428,10 +459,15 @@ NORMALIZE_ENABLED=0    # 多语言归一化（用 Qwen3-Embedding 时关闭）
 # ── 存储后端 ─────────────────────────────────────────────────
 STORE_BACKEND=sqlite   # sqlite | postgres
 PG_DSN=postgresql://memory:memory@localhost:5432/role_memory
+PG_POOL_MIN=2          # 异步连接池下限
+PG_POOL_MAX=20         # 异步连接池上限（多实例部署按 实例数×上限 规划 PG 连接数）
 
 # ── Redis 热缓存 ─────────────────────────────────────────────
+# 启用后同时获得：facts/relationship 热读缓存、查询 embedding 缓存、
+# 跨实例记忆加工分布式锁（多 worker 部署强烈建议开启）
 # REDIS_URL=redis://localhost:6379/0
 CACHE_TTL=600
+EMBED_CACHE_TTL=3600   # 查询 embedding 缓存 TTL
 
 # ── CORS（前后端分离）────────────────────────────────────────
 # 留空=放行所有来源；生产建议填前端域名白名单

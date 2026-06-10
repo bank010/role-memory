@@ -112,14 +112,16 @@ def _mock_chat(messages: List[Dict]) -> str:
 # 排除问句词，避免把「我叫什么」抽成名字
 _STOP = {"什么", "谁", "啥", "哪", "几"}
 _NAME_PAT = re.compile(r"(?:我叫|我的名字是|我名字叫)\s*([A-Za-z\u4e00-\u9fff]{1,12})")
-_LIKE_PAT = re.compile(r"(?:我喜欢|我爱|我最喜欢)\s*([^，。!?,.\n]{1,20})")
-_HATE_PAT = re.compile(r"(?:我讨厌|我害怕|我怕|我不喜欢)\s*([^，。!?,.\n]{1,20})")
+_LIKE_PAT = re.compile(r"我(?:也|还|很|超|特别|最|真的)*(?:喜欢|爱)\s*([^，。!?,.\n]{1,20})")
+_HATE_PAT = re.compile(r"我(?:也|还|很|超|特别|真的)*(?:讨厌|害怕|怕|不喜欢)\s*([^，。!?,.\n]{1,20})")
 _JOB_PAT = re.compile(r"(?:我是(?:一名|一个)?|我的工作是|我职业是)\s*([^，。!?,.\n]{1,15}?(?:师|员|生|家|手|长|工))")
 _PET_PAT = re.compile(r"(?:我养了?|我有(?:一只|只)?)\s*([^，。!?,.\n]{1,12}?(?:猫|狗|鸟|鱼|兔|仓鼠))")
 
 
 def _dialogue_only(prompt: str) -> str:
     """mock 抽取只看真正的对话部分，避免把 prompt 模板当成内容。"""
+    if "Dialogue:" in prompt and "JSON format:" in prompt:
+        return prompt.split("Dialogue:", 1)[1].split("JSON format:", 1)[0].strip()
     if "对话：" in prompt and "输出 JSON" in prompt:
         return prompt.split("对话：", 1)[1].split("输出 JSON", 1)[0].strip()
     return prompt.strip()
@@ -127,30 +129,40 @@ def _dialogue_only(prompt: str) -> str:
 
 def _mock_extract(prompt: str) -> dict:
     dialogue = _dialogue_only(prompt)
-    user_text = "\n".join(
-        line.split("用户:", 1)[1].strip()
-        for line in dialogue.splitlines() if line.strip().startswith("用户:")
-    ) or dialogue
+    user_lines = []
+    for line in dialogue.splitlines():
+        s = line.strip()
+        for prefix in ("User:", "用户:"):
+            if s.startswith(prefix):
+                user_lines.append(s.split(prefix, 1)[1].strip())
+                break
+    # 没有可识别的对话行（如 reflect 等其他 JSON 调用）：不要把 prompt 模板当对话抽取
+    if not user_lines:
+        return {"facts": [], "episode": None, "relationship": {}}
+    user_text = "\n".join(user_lines)
 
+    # key 用 schema 规范的 module:field 两段式：多值字段由 pipeline 按 value 自动派生
+    # entity 子键（喜欢A/喜欢B 各存一条，不互相覆盖）
     facts, importance = [], 3
     for m in _NAME_PAT.finditer(user_text):
         if m.group(1) not in _STOP:
-            facts.append({"key": "name", "value": m.group(1), "confidence": 0.9})
+            facts.append({"key": "identity:nickname", "value": m.group(1), "confidence": 0.9})
     for m in _JOB_PAT.finditer(user_text):
-        facts.append({"key": "job", "value": m.group(1), "confidence": 0.8})
+        facts.append({"key": "identity:job", "value": m.group(1), "confidence": 0.8})
     for m in _PET_PAT.finditer(user_text):
-        facts.append({"key": "pet", "value": f"养了{m.group(1)}", "confidence": 0.8})
+        facts.append({"key": "relationship:pet", "value": f"养了{m.group(1)}", "confidence": 0.8})
     for m in _LIKE_PAT.finditer(user_text):
-        facts.append({"key": f"like:{m.group(1)[:8]}", "value": f"喜欢{m.group(1)}", "confidence": 0.7})
+        facts.append({"key": "interest:other", "value": f"喜欢{m.group(1)}", "confidence": 0.7})
     for m in _HATE_PAT.finditer(user_text):
-        facts.append({"key": f"fear:{m.group(1)[:8]}", "value": f"害怕/讨厌{m.group(1)}", "confidence": 0.7})
+        facts.append({"key": "emotional:trigger", "value": f"害怕/讨厌{m.group(1)}", "confidence": 0.7})
         importance = 6
 
-    emotion = "中性"
+    # 记忆用用户的语言存储；情绪枚举值保持英文标识（neutral/expectant/tired）便于程序判断
+    emotion = "neutral"
     if any(k in user_text for k in ["约定", "答应", "承诺", "一起去", "约好"]):
-        importance, emotion = 8, "期待"
+        importance, emotion = 8, "expectant"
     elif any(k in user_text for k in ["累", "难过", "伤心", "烦"]):
-        emotion = "疲惫"
+        emotion = "tired"
 
     episode = None
     first_user = user_text.splitlines()[0].strip() if user_text.splitlines() else ""
@@ -162,7 +174,7 @@ def _mock_extract(prompt: str) -> dict:
         "relationship": {
             "intimacy_delta": round(0.02 + 0.03 * len(facts), 3),
             "trust_delta": 0.02 if facts else 0.0,
-            "mood": emotion if emotion != "中性" else "平静",
+            "mood": emotion if emotion != "neutral" else "calm",
             "stage": "",
         },
     }

@@ -45,6 +45,24 @@ async def embed(text: str) -> np.ndarray:
     return arr / norm if norm > 0 else arr
 
 
+async def embed_query(text: str) -> np.ndarray:
+    """读路径专用：带 Redis 缓存的查询向量化。
+
+    重复/相同问法直接命中缓存，省掉一次远程 embedding 调用（几十毫秒级），
+    是在线检索做到毫秒级的关键一环。写路径（记忆入库）仍走 embed()。
+    """
+    from app import cache
+
+    cached_blob = await cache.get_embedding(config.EMBED_MODEL, text)
+    if cached_blob is not None:
+        vec = from_blob(cached_blob)
+        if vec.size:
+            return vec
+    vec = await embed(text)
+    await cache.set_embedding(config.EMBED_MODEL, text, to_blob(vec))
+    return vec
+
+
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
     if a is None or b is None or a.size == 0 or b.size == 0 or a.size != b.size:
         return 0.0

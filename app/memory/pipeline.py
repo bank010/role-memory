@@ -1,18 +1,21 @@
 """异步记忆加工管线 —— 系统真正的"大脑"，与在线对话解耦。
 
-触发：每累计 PROCESS_EVERY 轮跑一次。
-动作：事实抽取 → 情节归纳 → 关系/情绪更新 →（更长周期）反思。
-全部在后台 task 中执行，异常只记日志，绝不影响对话。
+触发：每累计 PROCESS_EVERY 轮（默认 5）跑一次压缩，整体在后台 task 中异步执行。
+动作：结构化抽取 ∥ 滚动摘要（两路 LLM 并行）→ 画像/情节落库 → 关系+摘要一次写入
+      →（更长周期）章节归档、反思。
+异常只记日志，绝不影响对话；加工失败不推进游标，下次重试不丢记忆。
 """
 
 import asyncio
+import hashlib
 import logging
 import re
 import traceback
+import unicodedata
 import weakref
 from typing import Dict, List, Optional
 
-from app import config, llm
+from app import cache, config, llm
 from app.memory import stores
 
 log = logging.getLogger("memory.pipeline")
@@ -99,19 +102,34 @@ def _normalize_key(key: str) -> str:
 
 
 def _slug_from_value(value: str) -> str:
-    """从英文 value 派生一个稳定的 entity slug（小写、下划线、最长 24）。
+    """从 value 派生一个稳定的 entity slug（小写、最长 24），多语言安全。
 
-    抽取的 value 是英文（canonical），如 "user enjoys voyeurism" -> "voyeurism"。
-    取信息量最高的尾部词，去掉停用词，保证同一概念每次得到相同 slug。
+    记忆直接用用户的语言存储（不翻译），所以 value 可能是任何语言。
+    分层兜底，语言无关地保证唯一性：
+    1) 空格分词语言（英/俄/韩等）：逐词过滤停用词，取信息量最高的尾部
+       （"user enjoys voyeurism" -> "voyeurism"）；
+    2) 连写语言（中/日）：整句是一个 token，做词缀剥离提实体
+       （"喜欢吃寿司" -> "寿司"，"寿司が好き" -> "寿司"）；
+    3) 没有词表覆盖的语言：整短语直存——不够漂亮但确定且唯一，
+       重复条目由 upsert_fact 的语义合并（多语言 embedding）兜底；
+    4) 完全提不出 token：sha1 前 10 位兜底（确定且唯一，绝不覆盖同类）。
     """
     v = (value or "").strip().lower()
-    v = re.sub(r"[^a-z0-9\s_-]", " ", v)
-    tokens = [t for t in re.split(r"[\s_-]+", v) if t and t not in _STOPWORDS]
-    if not tokens:
+    # 只剥 Unicode 标点(P)/符号(S)，保留字母/数字/组合记号——
+    # 泰语/阿拉伯语等的组合元音符号不属于 \w，用 \w 过滤会把词切碎
+    cleaned = "".join(" " if unicodedata.category(ch)[0] in ("P", "S") else ch for ch in v)
+    tokens = [t for t in re.split(r"[\s_]+", cleaned)
+              if t and t not in _STOPWORDS and t not in _STOPWORDS_CJK]
+    # 连写语言的 token 内嵌着废词前后缀，剥出实体词（剥不动则原样保留）
+    tokens = [_strip_cjk_affixes(t) if _CJK_CHAR_RE.search(t) else t for t in tokens]
+    if tokens:
+        slug = "_".join(tokens[-2:]) if len(tokens) >= 2 else tokens[-1]
+        slug = slug[:24].strip("_")
+        if slug:
+            return slug
+    if not v:
         return "item"
-    # 取最后两个有意义的词，覆盖 "anal sex" / "role play" 这类短语
-    slug = "_".join(tokens[-2:]) if len(tokens) >= 2 else tokens[-1]
-    return slug[:24].strip("_") or "item"
+    return "h" + hashlib.sha1(v.encode("utf-8")).hexdigest()[:10]
 
 
 _STOPWORDS = {
@@ -120,6 +138,60 @@ _STOPWORDS = {
     "prefer", "into", "having", "have", "has", "with", "for", "user's", "their",
     "being", "doing", "wants", "want", "kink", "fetish", "play",
 }
+
+# 整 token 恰好是废词时直接丢弃（带空格的中文、或单独成词的情况）
+_STOPWORDS_CJK = {
+    "喜欢", "喜爱", "讨厌", "害怕", "想要", "用户", "我", "他", "她", "它",
+    "的", "了", "是", "在", "有", "很", "非常", "最",
+}
+
+# 连写语言（中/日）没有空格，整句是一个 token，整词匹配永不命中——
+# 必须用「词缀剥离」：从开头/结尾循环剥掉高频动词/代词/助词，剥出真正的实体词。
+#   "喜欢吃寿司" -> 剥"喜欢" -> 剥"吃" -> "寿司"；"寿司が好き" -> 剥"が好き" -> "寿司"
+# 其他语言没有词表也不要紧：整短语直存，唯一性不受影响（见 _slug_from_value 分层兜底）。
+# 汉字 + 日文假名（命中则按连写语言处理）
+_CJK_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+
+# 长词在前，保证"我们"先于"我"匹配。
+_CJK_PREFIXES = sorted([
+    "我们", "我", "你", "他", "她", "它", "用户",
+    "喜欢", "喜爱", "热爱", "讨厌", "害怕", "想要", "想", "爱", "恨", "怕",
+    "也", "还", "都", "很", "非常", "特别", "超", "最", "真的",
+    "吃", "喝", "玩", "看", "听", "养", "去", "学", "做",
+    "的", "了", "是", "在", "有", "一只", "只", "一个", "个",
+    # 日语主语/提示助词开头
+    "私は", "僕は", "俺は", "ユーザーは",
+], key=len, reverse=True)
+
+_CJK_SUFFIXES = sorted([
+    # 中文句尾虚词
+    "的", "了", "呢", "啊", "吧",
+    # 日语好恶/愿望/敬体句尾
+    "が好きです", "が好き", "が嫌いです", "が嫌い", "が怖い", "を好む",
+    "したいです", "したい", "です", "ます",
+], key=len, reverse=True)
+
+
+def _strip_cjk_affixes(token: str) -> str:
+    """对连写语言 token 循环剥离停用前缀/后缀，剥出实体词。
+
+    保护：剩余长度 < 2 时停止剥离（"寿司"不能被剥成单字/空），
+    完全剥不动就原样返回——任何情况下结果都非空、确定。
+    """
+    changed = True
+    while changed and len(token) > 2:
+        changed = False
+        for p in _CJK_PREFIXES:
+            if token.startswith(p) and len(token) - len(p) >= 2:
+                token = token[len(p):]
+                changed = True
+                break
+        for s in _CJK_SUFFIXES:
+            if token.endswith(s) and len(token) - len(s) >= 2:
+                token = token[:-len(s)]
+                changed = True
+                break
+    return token
 
 
 def _ensure_appendable_entity(key: str, value: str) -> str:
@@ -189,15 +261,23 @@ FACTS RULES:
 - Describe ONLY the HUMAN USER ({user_tok}). NEVER store {char_tok}'s own persona traits.
 - Always start a fact value with "{user_tok} ..." for clarity.
 - Only return "facts": [] if {user_tok} truly revealed nothing about their preferences/traits this batch.
-- Write "value"/"event"/"mood" in ENGLISH (canonical memory language), using {user_tok}/{char_tok} tokens.
+- LANGUAGE: write "value"/"event"/"mood" in THE SAME LANGUAGE THE USER SPEAKS in the dialogue.
+  Do NOT translate to English or any other language — store memories exactly in the user's language
+  so they read naturally when recalled. (Keys are english identifiers; values follow the user.)
 - Choose "key" from the FIELD CATALOG below. Use exactly "module:field" for single-value fields,
-  or "module:field:entity" (entity in lowercase english) for multi-item fields so they don't overwrite.
+  or "module:field:entity" for multi-item fields so they don't overwrite.
+  ALWAYS include the ":entity" segment for multi-item fields, whatever language the user speaks —
+  entity is a short lowercase english word identifying the item (e.g. user says "我喜欢吃寿司" → "interest:other:sushi").
     GOOD: "preference:content:cyberpunk", "nsfw:xp:sm", "identity:job"
 - If unsure which catalog key fits, pick the closest module and add a short english entity
   (e.g. "nsfw:xp:roleplay", "interest:other:worldbuilding") rather than dropping the fact.
 - Reuse an EXISTING key (listed under known facts) when the new info is about the same item.
-- If {user_tok} changes their mind, REUSE THE SAME KEY and update the value
-  (e.g. "{user_tok} no longer likes jazz (previously liked it)").
+- CONTRADICTIONS / CHANGES OF MIND — when new info conflicts with a known fact:
+  * If it is an UPDATE (changed preference/situation), REUSE THE EXACT SAME KEY from the known
+    facts list and write the new value (e.g. "{user_tok} no longer likes jazz (previously liked it)").
+    NEVER create a second key for the same item — that would leave two contradicting facts.
+  * If {user_tok} explicitly retracts something (it was wrong / no longer true and should be
+    FORGOTTEN), output {{"key": "<the existing key>", "op": "delete"}} to remove it.
 
 EPISODES RULES:
 - Write the event using {user_tok}/{char_tok} tokens (see POV rule above).
@@ -215,14 +295,15 @@ Dialogue:
 
 JSON format:
 {{
-  "facts": [{{"key": "module:field or module:field:entity", "value": "english fact about the user", "confidence": 0.0-1.0}}],
-  "episode": {{"event": "one english sentence of what happened; empty string if nothing worth keeping", "emotion": "english emotion word", "importance": integer 1-10, "sensitive": true/false}},
-  "relationship": {{"intimacy_delta": -0.1 to 0.2, "trust_delta": -0.1 to 0.2, "stage": "relationship stage (optional)", "mood": "character's current mood in english"}}
+  "facts": [{{"key": "module:field or module:field:entity", "value": "fact about the user, in the user's language", "confidence": 0.0-1.0, "op": "upsert|delete (optional, default upsert)"}}],
+  "episode": {{"event": "one sentence of what happened, in the user's language; empty string if nothing worth keeping", "emotion": "emotion word in the user's language", "importance": integer 1-10, "sensitive": true/false}},
+  "relationship": {{"intimacy_delta": -0.1 to 0.2, "trust_delta": -0.1 to 0.2, "stage": "relationship stage (optional)", "mood": "character's current mood, in the user's language"}}
 }}
 Output JSON only, no explanation."""
 
 _SUMMARY_PROMPT = """Maintain a rolling summary of an ongoing role-play between a character and a user.
-Merge the previous summary with the new dialogue into an updated, concise summary in ENGLISH.
+Merge the previous summary with the new dialogue into an updated, concise summary,
+written in THE SAME LANGUAGE THE USER SPEAKS in the dialogue (do NOT translate).
 
 POINT OF VIEW — write in clear third-person using the REAL NAMES below:
 - Refer to the character as: {char_tok}
@@ -243,14 +324,23 @@ Output ONLY the updated summary text."""
 
 _REFLECT_PROMPT = """Based on these recent episodes, derive ONE high-level insight about the user {user_tok}
 (what they truly care about, their personality, the interaction pattern between {char_tok} and {user_tok}).
-Write it in ENGLISH using the real names {user_tok} and {char_tok}.
+Write it in THE SAME LANGUAGE as the episodes below, using the real names {user_tok} and {char_tok}.
 This insight will be stored as an important memory.
 
 Recent episodes:
 {episodes}
 
-Output JSON: {{"insight": "one english sentence insight about {user_tok}", "importance": integer 7-10}}
+Output JSON: {{"insight": "one-sentence insight about {user_tok}, in the episodes' language", "importance": integer 7-10}}
 JSON only."""
+
+
+def _crossed(after: int, now: int, period: int) -> bool:
+    """本批对话 (after, now] 是否跨过了 period 的整数倍边界。
+
+    触发点不一定恰好落在整数倍轮次上（burst 消息时 now 可能是 52 而非 50），
+    用边界穿越判断替代 `now % period == 0`，保证周期性动作不会被跳过。
+    """
+    return now // period > after // period
 
 
 def _format_dialogue(turns: List[Dict]) -> str:
@@ -285,32 +375,44 @@ async def maybe_process(session: str, user_id: str = "", role_id: str = "",
     char_name/user_name：当前会话的真实角色名/用户名，直接写进记忆（情节/画像/摘要），
     使记忆里就是真名而非占位符，展示与检索都自然。未传则回退到通用称谓。
 
-    并发安全：同一 session 串行加工（session 级锁）；快速预检在锁外，真正加工在锁内二次确认，
-    避免多个并发请求重复抽取同一批对话、或把 last_processed 推乱。
+    并发安全（两级锁）：
+    - 进程内 session 级 asyncio.Lock：同进程并发请求串行；
+    - Redis 分布式锁（启用 Redis 时）：多 worker / 多实例下同一 session 也不会并发加工。
+    快速预检在锁外，真正加工在锁内二次确认，避免重复抽取同一批对话、或把 last_processed 推乱。
     """
     # 锁外快速预检：未到触发点直接返回，避免无谓抢锁
-    if stores.max_turn(session) - stores.get_last_processed(session) < config.PROCESS_EVERY:
+    if (await stores.max_turn(session)
+            - await stores.get_last_processed(session)) < config.PROCESS_EVERY:
         return
 
     lock = await _get_session_lock(session)
     async with lock:
-        # 锁内二次确认：可能在等锁期间已被另一协程加工过
-        last = stores.get_last_processed(session)
-        now = stores.max_turn(session)
-        if now - last < config.PROCESS_EVERY:
+        # 跨实例互斥：抢不到说明别的实例正在加工，本次放弃（下一轮触发会补上）
+        token = await cache.acquire_lock(f"process:{session}", ttl_sec=120)
+        if token is None:
             return
         try:
-            await _process(session, last, now, user_id, role_id, char_name, user_name)
-            # 仅在加工全程成功后才推进进度；任何异常都不推进，下次重试不丢这批记忆
-            stores.set_last_processed(session, now, user_id, role_id)
-        except Exception as e:
-            log.error("记忆加工失败 session=%s err=%s\n%s", session, e, traceback.format_exc())
+            # 锁内二次确认：可能在等锁期间已被另一协程/实例加工过
+            last = await stores.get_last_processed(session)
+            now = await stores.max_turn(session)
+            if now - last < config.PROCESS_EVERY:
+                return
+            try:
+                await _process(session, last, now, user_id, role_id, char_name, user_name)
+                # 仅在加工全程成功后才推进进度；任何异常都不推进，下次重试不丢这批记忆
+                await stores.set_last_processed(session, now, user_id, role_id)
+            except Exception as e:
+                log.error("记忆加工失败 session=%s err=%s\n%s", session, e, traceback.format_exc())
+        finally:
+            await cache.release_lock(f"process:{session}", token)
 
 
 async def _process(session: str, after: int, now: int,
                    user_id: str = "", role_id: str = "",
                    char_name: str = "", user_name: str = "") -> None:
-    new_turns = stores.turns_after(session, after)
+    """单次记忆压缩。内部两路 LLM（结构化抽取 + 滚动摘要）并行跑，
+    墙钟耗时 ≈ 一次 LLM 调用；摘要与关系增量合并为一次读-改-写，避免并行双写丢更新。"""
+    new_turns = await stores.turns_after(session, after)
     if not new_turns:
         return
     dialogue = _format_dialogue(new_turns)
@@ -319,30 +421,53 @@ async def _process(session: str, after: int, now: int,
     user_tok = (user_name or "").strip() or "the user"
     char_tok = (char_name or "").strip() or "the character"
 
-    known = stores.all_facts(session)
+    # 已知画像 + 当前关系（取旧摘要）并行读
+    known, rel_now = await asyncio.gather(
+        stores.all_facts(session), stores.get_relationship(session))
     known_facts = "\n".join(f"- {f['key']}: {f['value']}" for f in known) or "(none yet)"
+    prev_summary = (rel_now.get("summary") or "").strip()
 
     from app.memory import profile_schema
     field_catalog = profile_schema.prompt_field_catalog(include_sensitive=config.NSFW_ENABLED)
 
-    data = await llm.extract_json(
-        _EXTRACT_PROMPT.format(dialogue=dialogue, known_facts=known_facts,
-                               field_catalog=field_catalog,
-                               user_tok=user_tok, char_tok=char_tok)
+    # 两路 LLM 并行：抽取与摘要互不依赖，不必串行等待
+    data, summary = await asyncio.gather(
+        llm.extract_json(
+            _EXTRACT_PROMPT.format(dialogue=dialogue, known_facts=known_facts,
+                                   field_catalog=field_catalog,
+                                   user_tok=user_tok, char_tok=char_tok)
+        ),
+        _gen_summary(session, dialogue, prev_summary, user_tok, char_tok),
     )
 
-    if not data:
+    # 章节归档：旧摘要被新摘要覆盖前，定期存为可召回的 [chapter] 情节（去重由 add_episode 兜底）
+    if prev_summary and summary and _crossed(after, now, config.PROCESS_EVERY * 10):
+        try:
+            await stores.add_episode(session, f"[chapter] {prev_summary}", "narrative", 7, now,
+                                     user_id=user_id, role_id=role_id)
+        except Exception as e:
+            log.warning("章节归档失败 session=%s err=%s", session, e)
+
+    if not data and not summary:
         return
 
     # ---- facts：key 规范 + value 截断 + confidence clamp ----
-    raw_facts = data.get("facts") or []
+    raw_facts = (data or {}).get("facts") or []
     log.info("抽取返回 facts=%d episode=%s session=%s | raw_keys=%s",
-             len(raw_facts), bool((data.get("episode") or {}).get("event")), session,
+             len(raw_facts), bool(((data or {}).get("episode") or {}).get("event")), session,
              [f.get("key") for f in raw_facts])
+    known_keys = {f["key"] for f in known}
     skipped_facts = 0
     for f in raw_facts:
         raw_key = f.get("key")
         key = _clean_key(raw_key)
+        # 撤回操作：用户明确改口/否认时删除既有事实（只允许删已知 key，防误删）
+        if f.get("op") == "delete":
+            target = raw_key if raw_key in known_keys else (key if key in known_keys else None)
+            if target:
+                await stores.delete_facts(session, [target])
+                log.info("撤回 fact: %s session=%s", target, session)
+            continue
         value = _clean_str(f.get("value"), 500)
         if not key or not value:
             skipped_facts += 1
@@ -359,7 +484,7 @@ async def _process(session: str, after: int, now: int,
         log.warning("facts 校验丢弃 %d 条（key/value 非法）session=%s", skipped_facts, session)
 
     # ---- episode：event 截断 + importance clamp + sensitive 标记 ----
-    ep = data.get("episode") or {}
+    ep = (data or {}).get("episode") or {}
     event = _clean_str(ep.get("event"), 300)
     if event:
         emotion = _clean_str(ep.get("emotion"), 50) or "neutral"
@@ -371,48 +496,49 @@ async def _process(session: str, after: int, now: int,
             await stores.add_episode(session, event, emotion, importance, now, sensitive,
                                      user_id, role_id)
 
-    # ---- relationship：delta clamp + stage/mood 截断 ----
-    rel = data.get("relationship") or {}
-    stores.update_relationship(
+    # ---- relationship：delta clamp + stage/mood 截断 + 新摘要，合并为一次读-改-写 ----
+    rel = (data or {}).get("relationship") or {}
+    await stores.update_relationship(
         session,
         intimacy_delta=_clamp_float(rel.get("intimacy_delta"), -0.2, 0.3, 0.0),
         trust_delta=_clamp_float(rel.get("trust_delta"), -0.2, 0.3, 0.0),
         stage=_clean_str(rel.get("stage"), 30),
         mood=_clean_str(rel.get("mood"), 30),
+        summary=summary or None,
         turn=now, user_id=user_id, role_id=role_id,
     )
 
-    await _update_summary(session, dialogue, now, user_id, role_id, char_name, user_name)
-    await _maybe_reflect(session, now, user_id, role_id, char_name, user_name)
+    await _maybe_reflect(session, after, now, user_id, role_id, char_name, user_name)
 
 
-async def _update_summary(session: str, dialogue: str, now: int,
-                          user_id: str = "", role_id: str = "",
-                          char_name: str = "", user_name: str = "") -> None:
-    """滚动摘要：用 旧摘要 + 本批新对话 增量更新，存进 relationship.summary。"""
-    user_tok = (user_name or "").strip() or "the user"
-    char_tok = (char_name or "").strip() or "the character"
+async def _gen_summary(session: str, dialogue: str, prev: str,
+                       user_tok: str, char_tok: str) -> str:
+    """生成新的滚动摘要文本（纯 LLM 调用，不落库；与抽取并行跑）。
+
+    分层摘要：滚动摘要只有 120 词、每次覆盖重写，长期剧情会被反复压缩掉，
+    归档为 [chapter] 情节的逻辑在 _process 中（写库统一收口）。
+    失败返回空串：摘要挂掉不影响画像/情节落库。
+    """
     try:
-        prev = stores.get_relationship(session).get("summary") or "(none)"
         summary = await llm.chat(
             [{"role": "user", "content": _SUMMARY_PROMPT.format(
-                prev=prev, dialogue=dialogue, user_tok=user_tok, char_tok=char_tok)}],
+                prev=prev or "(none)", dialogue=dialogue,
+                user_tok=user_tok, char_tok=char_tok)}],
             model=config.EXTRACT_MODEL, temperature=0.3, max_tokens=300,
             use_extract_endpoint=True,
         )
-        summary = (summary or "").strip()
-        if summary:
-            stores.update_relationship(session, summary=summary, turn=now,
-                                       user_id=user_id, role_id=role_id)
+        return (summary or "").strip()
     except Exception as e:
-        log.warning("滚动摘要更新失败 session=%s err=%s", session, e)
+        log.warning("滚动摘要生成失败 session=%s err=%s", session, e)
+        return ""
 
 
-async def _maybe_reflect(session: str, now: int, user_id: str = "", role_id: str = "",
+async def _maybe_reflect(session: str, after: int, now: int,
+                         user_id: str = "", role_id: str = "",
                          char_name: str = "", user_name: str = "") -> None:
-    """更长周期的反思：每 ~5 个加工周期归纳一条高层洞察。"""
-    episodes = stores.all_episodes(session)
-    if len(episodes) < config.PROCESS_EVERY * 2 or now % (config.PROCESS_EVERY * 3) != 0:
+    """更长周期的反思：每 ~3 个加工周期归纳一条高层洞察。"""
+    episodes = await stores.all_episodes(session)
+    if len(episodes) < config.PROCESS_EVERY * 2 or not _crossed(after, now, config.PROCESS_EVERY * 3):
         return
     episodes.sort(key=lambda e: e["turn"], reverse=True)
     recent = episodes[:8]

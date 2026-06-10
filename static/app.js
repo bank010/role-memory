@@ -87,12 +87,32 @@ async function health() {
   renderRoleSelect();
 }
 
-function addMsg(role, text) {
+function addMsg(role, text, timeMeta) {
   const div = document.createElement("div");
   div.className = "msg " + role;
   div.textContent = text;
+  if (timeMeta) {
+    const t = document.createElement("div");
+    t.className = "msg-time";
+    t.textContent = timeMeta;
+    div.appendChild(t);
+  }
   $("messages").appendChild(div);
   $("messages").scrollTop = $("messages").scrollHeight;
+}
+
+// 耗时标签：总耗时 + 分段（记忆读路径 / LLM 生成），一眼看出慢在哪
+function fmtTiming(timing, clientMs) {
+  if (!timing) return clientMs != null ? `${(clientMs / 1000).toFixed(1)}s` : "";
+  const sec = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
+  const parts = [];
+  if (timing.total != null) parts.push(`总 ${sec(timing.total)}`);
+  if (timing.context != null) parts.push(`记忆 ${sec(timing.context)}`);
+  if (timing.llm != null) parts.push(`生成 ${sec(timing.llm)}`);
+  if (clientMs != null && timing.total != null && clientMs - timing.total > 300) {
+    parts.push(`网络 ${sec(clientMs - timing.total)}`);
+  }
+  return parts.join(" · ");
 }
 
 async function send() {
@@ -107,6 +127,7 @@ async function send() {
   busy = true;
   $("input").value = "";
   addMsg("user", text);
+  const tSend = performance.now();
 
   try {
     const resp = await fetch("/api/chat", {
@@ -137,8 +158,8 @@ async function send() {
       return;
     }
 
-    addMsg("ai", res.reply || "(空回复)");
     const dbg = res.debug || {};
+    addMsg("ai", res.reply || "(空回复)", fmtTiming(dbg.timing_ms, performance.now() - tSend));
     renderRetrieved(dbg.retrieved_episodes || []);
     renderVerbatim(dbg.retrieved_verbatim || []);
     $("sysprompt").textContent = dbg.system_prompt || "";

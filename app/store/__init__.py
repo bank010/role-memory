@@ -21,7 +21,8 @@ def get_store() -> BaseStore:
 
     if config.STORE_BACKEND == "postgres":
         from app.store.postgres_store import PostgresStore
-        _backend = PostgresStore(config.PG_DSN, config.EMBED_DIM)
+        _backend = PostgresStore(config.PG_DSN, config.EMBED_DIM,
+                                 config.PG_POOL_MIN, config.PG_POOL_MAX)
     else:
         from app.store.sqlite_store import SqliteStore
         _backend = SqliteStore(str(config.DB_PATH))

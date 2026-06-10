@@ -67,6 +67,7 @@ main { flex: 1; display: grid; grid-template-columns: 1fr 420px; overflow: hidde
 .msg.user { align-self: flex-end; background: var(--accent); color: #0b0d12; border-bottom-right-radius: 4px; }
 .msg.ai { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
 .msg.sys { align-self: center; font-size: 12px; color: var(--muted); background: transparent; }
+.msg-time { margin-top: 6px; font-size: 11px; color: var(--muted); user-select: none; }
 .composer { display: flex; gap: 10px; padding: 14px; border-top: 1px solid var(--line); background: var(--panel); }
 .composer textarea { flex: 1; resize: none; background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 10px; font-size: 14px; font-family: inherit; }
 .hint { font-size: 11px; color: var(--muted); padding: 0 14px 10px; background: var(--panel); }

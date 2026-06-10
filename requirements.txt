@@ -6,7 +6,7 @@ pydantic>=2.8,<3
 python-dotenv>=1.0,<2
 
 # ---- 生产级存储（STORE_BACKEND=postgres 时需要）----
-psycopg[binary]>=3.1,<4
+psycopg[binary,pool]>=3.1,<4
 pgvector>=0.3,<0.4
 
 # ---- Redis 热缓存（配置 REDIS_URL 时需要）----
