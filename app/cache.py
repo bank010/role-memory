@@ -39,11 +39,16 @@ async def _get_client():
             return None
         try:
             import redis.asyncio as aioredis
-            c = aioredis.from_url(config.REDIS_URL, decode_responses=True,
-                                  socket_connect_timeout=1, socket_timeout=1)
+            c = aioredis.from_url(
+                config.REDIS_URL,
+                decode_responses=True,
+                max_connections=config.REDIS_MAX_CONNECTIONS,
+                socket_connect_timeout=config.REDIS_SOCKET_CONNECT_TIMEOUT,
+                socket_timeout=config.REDIS_SOCKET_TIMEOUT,
+            )
             await c.ping()
             _client = c
-            log.info("Redis 缓存已启用: %s", config.REDIS_URL)
+            log.info("Redis 缓存已启用: %s (pool=%d)", config.REDIS_URL, config.REDIS_MAX_CONNECTIONS)
         except Exception as e:
             log.warning("Redis 不可用，降级为直查后端: %s", e)
             _client = None

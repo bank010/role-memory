@@ -17,6 +17,9 @@ class ChatRequest(BaseModel):
     # 前端传入用于替换角色设定里的 {{char}} / {{user}}（对应主项目的 bot_name / user_name）
     char_name: Optional[str] = None
     user_name: Optional[str] = None
+    # 回复语言：传了就在 system prompt 里强制用该语言回复（如 "中文"/"English"）；
+    # 不传则不注入语言规则，由角色卡自行约定。
+    language: Optional[str] = None
 
 
 class ResetRequest(BaseModel):

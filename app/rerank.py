@@ -22,6 +22,8 @@ from app import config
 
 log = logging.getLogger("rerank")
 
+_sem = asyncio.Semaphore(config.RERANK_CONCURRENCY)
+
 # 官方推荐模板（来自 vLLM issue #21681 / Qwen3-Reranker 文档）
 _INSTRUCT = "Given a query about the user, retrieve memory entries relevant to answering it"
 _PREFIX = ('<|im_start|>system\nJudge whether the Document meets the requirements '
@@ -32,7 +34,15 @@ _SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 _client = httpx.AsyncClient(
     base_url=config.RERANK_BASE_URL or "http://localhost",
     headers={"Authorization": f"Bearer {config.RERANK_API_KEY}"},
-    timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
+    timeout=httpx.Timeout(
+        connect=config.HTTPX_CONNECT_TIMEOUT,
+        read=config.HTTPX_READ_TIMEOUT,
+        write=10.0, pool=10.0,
+    ),
+    limits=httpx.Limits(
+        max_connections=config.HTTPX_MAX_CONNECTIONS,
+        max_keepalive_connections=config.HTTPX_MAX_KEEPALIVE,
+    ),
 )
 
 
@@ -49,14 +59,15 @@ def _fmt_doc(d: str) -> str:
 
 
 async def _call(query: str, docs: List[str]) -> List[Tuple[int, float]]:
-    resp = await _client.post("/rerank", json={
-        "model": config.RERANK_MODEL,
-        "query": _fmt_query(query),
-        "documents": [_fmt_doc(d) for d in docs],
-    })
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    return [(r["index"], float(r.get("relevance_score", 0.0))) for r in results]
+    async with _sem:
+        resp = await _client.post("/rerank", json={
+            "model": config.RERANK_MODEL,
+            "query": _fmt_query(query),
+            "documents": [_fmt_doc(d) for d in docs],
+        })
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        return [(r["index"], float(r.get("relevance_score", 0.0))) for r in results]
 
 
 async def rerank(query: str, docs: List[str]) -> List[Tuple[int, float]]:

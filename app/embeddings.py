@@ -5,7 +5,9 @@
 本地向量精度远不如真实模型，但足够展示"相关性召回"的机制。
 """
 
+import asyncio
 import hashlib
+import logging
 from typing import List
 
 import httpx
@@ -13,12 +15,24 @@ import numpy as np
 
 from app import config
 
+log = logging.getLogger("embeddings")
+
 _LOCAL_DIM = 256
+
+_sem = asyncio.Semaphore(config.EMBED_CONCURRENCY)
 
 _client = httpx.AsyncClient(
     base_url=config.EMBED_BASE_URL,
     headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"},
-    timeout=httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0),
+    timeout=httpx.Timeout(
+        connect=config.HTTPX_CONNECT_TIMEOUT,
+        read=config.HTTPX_READ_TIMEOUT,
+        write=10.0, pool=10.0,
+    ),
+    limits=httpx.Limits(
+        max_connections=config.HTTPX_MAX_CONNECTIONS,
+        max_keepalive_connections=config.HTTPX_MAX_KEEPALIVE,
+    ),
 )
 
 
@@ -33,16 +47,31 @@ def _local_embed(text: str) -> np.ndarray:
     return vec / norm if norm > 0 else vec
 
 
+async def _embed_remote(text: str) -> np.ndarray:
+    """带信号量 + 重试的远程 embedding 调用。"""
+    last_err = None
+    for attempt in range(config.API_RETRIES + 1):
+        async with _sem:
+            try:
+                resp = await _client.post(
+                    "/embeddings", json={"model": config.EMBED_MODEL, "input": text[:4000]}
+                )
+                resp.raise_for_status()
+                arr = np.array(resp.json()["data"][0]["embedding"], dtype=np.float32)
+                norm = np.linalg.norm(arr)
+                return arr / norm if norm > 0 else arr
+            except Exception as e:
+                last_err = e
+                if attempt < config.API_RETRIES:
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                    log.debug("embed 重试 %d/%d err=%s", attempt + 1, config.API_RETRIES, e)
+    raise last_err
+
+
 async def embed(text: str) -> np.ndarray:
     if not config.EMBED_REAL:
         return _local_embed(text)
-    resp = await _client.post(
-        "/embeddings", json={"model": config.EMBED_MODEL, "input": text[:4000]}
-    )
-    resp.raise_for_status()
-    arr = np.array(resp.json()["data"][0]["embedding"], dtype=np.float32)
-    norm = np.linalg.norm(arr)
-    return arr / norm if norm > 0 else arr
+    return await _embed_remote(text)
 
 
 async def embed_query(text: str) -> np.ndarray:

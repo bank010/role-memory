@@ -70,11 +70,14 @@ def _split(session: str):
 class SqliteStore(BaseStore):
     def __init__(self, path: str):
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
 
     async def init(self) -> None:
         with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
             cols = [r[1] for r in self._conn.execute("PRAGMA table_info(chunks)").fetchall()]
             if "norm" not in cols:
@@ -173,6 +176,10 @@ class SqliteStore(BaseStore):
     async def max_turn(self, session):
         row = self._one("SELECT COALESCE(MAX(turn),0) AS m FROM turns WHERE session=?", (session,))
         return row["m"] or 0
+
+    async def first_turn_ts(self, session):
+        row = self._one("SELECT MIN(ts) AS ts FROM turns WHERE session=?", (session,))
+        return row["ts"] if row else None
 
     # ---- facts ----
     async def upsert_fact(self, session, key, value, confidence, turn, vec=None,

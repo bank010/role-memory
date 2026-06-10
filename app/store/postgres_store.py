@@ -181,6 +181,11 @@ class PostgresStore(BaseStore):
             "SELECT COALESCE(MAX(turn),0) AS m FROM turns WHERE session=%s", (session,))
         return row["m"] or 0
 
+    async def first_turn_ts(self, session):
+        row = await self._one(
+            "SELECT MIN(ts) AS ts FROM turns WHERE session=%s", (session,))
+        return row["ts"] if row else None
+
     # ---- facts ----
     async def upsert_fact(self, session, key, value, confidence, turn, vec=None,
                           user_id="", role_id=""):

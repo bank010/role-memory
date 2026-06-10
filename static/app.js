@@ -70,6 +70,13 @@ function getRoleId() {
   return getCurrentRoleId() || "default";
 }
 
+// 回复语言：选了就强制该语言回复（注入 system prompt），空 = 跟随角色卡
+const LANG_KEY = "rm_language";
+
+function getLanguage() {
+  return $("language") ? $("language").value : "";
+}
+
 function memParams() {
   return `user_id=${encodeURIComponent(getUserId())}&role_id=${encodeURIComponent(getRoleId())}`;
 }
@@ -87,10 +94,22 @@ async function health() {
   renderRoleSelect();
 }
 
+function formatRpText(raw) {
+  const escaped = escapeHtml(raw);
+  return escaped
+    .replace(/\*([^*\n]+?)\*/g, '<em class="action">$1</em>')
+    .replace(/\n{2,}/g, '<br><br>')
+    .replace(/\n/g, '<br>');
+}
+
 function addMsg(role, text, timeMeta) {
   const div = document.createElement("div");
   div.className = "msg " + role;
-  div.textContent = text;
+  if (role === "ai") {
+    div.innerHTML = formatRpText(text);
+  } else {
+    div.textContent = text;
+  }
   if (timeMeta) {
     const t = document.createElement("div");
     t.className = "msg-time";
@@ -140,6 +159,7 @@ async function send() {
         persona_text: role.prompt || "",
         char_name: role.charName || null,
         user_name: $("user-name").value.trim() || null,
+        language: getLanguage() || null,
       }),
     });
 
@@ -373,6 +393,9 @@ async function deleteRole() {
 }
 
 $("send-btn").onclick = send;
+$("language").addEventListener("change", () => {
+  localStorage.setItem(LANG_KEY, getLanguage());
+});
 $("reset-btn").onclick = reset;
 $("reprocess-btn").onclick = reprocess;
 $("persona").addEventListener("change", onSelectRole);
@@ -403,16 +426,18 @@ async function loadHistory() {
     return;
   }
   addMsg("sys", `— 已恢复 ${turns.length} 轮历史记录 —`);
-  turns.forEach((t) => {
+  for (const t of turns) {
     if (t.user_msg) addMsg("user", t.user_msg);
     if (t.ai_reply) addMsg("ai", t.ai_reply);
-  });
+  }
 }
 
 (async () => {
   // 先填好 user-id 输入框（持久化值），再渲染角色下拉，最后按当前 (user×role) 加载记忆
   const el = $("user-id");
   if (el) el.value = localStorage.getItem("rm_user_id") || getUserId();
+  const langSel = $("language");
+  if (langSel) langSel.value = localStorage.getItem(LANG_KEY) || "";
   await health();
   // 确保有一个“当前角色”被选中
   const roles = loadRoles();

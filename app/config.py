@@ -105,15 +105,30 @@ QUERY_AUGMENT_MAX_LEN = int(os.getenv("QUERY_AUGMENT_MAX_LEN", "24"))
 # 偏高以避免误合并（如 cilantro 与 shrimp 不应合并）。
 FACT_MERGE_THRESHOLD = float(os.getenv("FACT_MERGE_THRESHOLD", "0.86"))
 
+# ---- 连接池（面向 5000+ 并发设计）----
+# httpx 连接池：每个外部端点（LLM chat/extract、embedding、rerank）独立池
+# max_connections = 单端点最大并发 TCP 连接数；keepalive = 长连接复用数
+HTTPX_MAX_CONNECTIONS = int(os.getenv("HTTPX_MAX_CONNECTIONS", "500"))
+HTTPX_MAX_KEEPALIVE = int(os.getenv("HTTPX_MAX_KEEPALIVE", "100"))
+# 各外部 API 最大并发信号量：防止瞬间打爆下游，超出的排队等待
+EMBED_CONCURRENCY = int(os.getenv("EMBED_CONCURRENCY", "50"))
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "100"))
+RERANK_CONCURRENCY = int(os.getenv("RERANK_CONCURRENCY", "30"))
+# 外部调用失败重试次数
+API_RETRIES = int(os.getenv("API_RETRIES", "2"))
+# httpx 超时（秒）
+HTTPX_CONNECT_TIMEOUT = float(os.getenv("HTTPX_CONNECT_TIMEOUT", "15"))
+HTTPX_READ_TIMEOUT = float(os.getenv("HTTPX_READ_TIMEOUT", "60"))
+
 # ---- 存储后端 ----
 # sqlite  : 零依赖，开箱即跑（demo 默认）
 # postgres: 生产级，pgvector 存向量 + 原生 KNN 预筛
 STORE_BACKEND = _get("STORE_BACKEND", default="sqlite").lower()
 DB_PATH = BASE_DIR / "memory.db"
 PG_DSN = _get("PG_DSN", "DATABASE_URL", default="postgresql://localhost:5432/role_memory")
-# Postgres 异步连接池大小（百万用户级部署按实例数 × 池大小规划 PG max_connections / PgBouncer）
-PG_POOL_MIN = int(os.getenv("PG_POOL_MIN", "2"))
-PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "20"))
+# Postgres 异步连接池：5000 并发建议 pool_max >= 100（配合 PgBouncer 可更小）
+PG_POOL_MIN = int(os.getenv("PG_POOL_MIN", "10"))
+PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "100"))
 
 # ---- Redis 热缓存（留空则关闭，自动降级为直查后端）----
 REDIS_URL = _get("REDIS_URL")
@@ -121,6 +136,10 @@ CACHE_ENABLED = bool(REDIS_URL)
 CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))
 # 查询 embedding 缓存 TTL（读路径毫秒级的关键之一：重复/相近问法免一次 embed 调用）
 EMBED_CACHE_TTL = int(os.getenv("EMBED_CACHE_TTL", "3600"))
+# Redis 连接池
+REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "200"))
+REDIS_SOCKET_TIMEOUT = float(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
+REDIS_SOCKET_CONNECT_TIMEOUT = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "3"))
 
 # ---- CORS（前后端分离）----
 # 逗号分隔的前端域名白名单；留空则放行所有来源（"*"）。

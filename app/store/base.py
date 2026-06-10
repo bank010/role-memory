@@ -46,6 +46,10 @@ class BaseStore(ABC):
     async def max_turn(self, session: str) -> int:
         ...
 
+    async def first_turn_ts(self, session: str) -> Optional[float]:
+        """返回该会话第一轮的 ts（unix 时间戳），无记录返回 None。"""
+        return None
+
     # ---- 语义记忆 facts ----
     @abstractmethod
     async def upsert_fact(self, session: str, key: str, value: str,

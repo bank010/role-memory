@@ -24,6 +24,19 @@
       <label>{{user}}
         <input id="user-name" type="text" placeholder="用户名(可空)" />
       </label>
+      <label>回复语言
+        <select id="language">
+          <option value="">跟随角色卡</option>
+          <option value="中文">中文</option>
+          <option value="English">English</option>
+          <option value="日本語">日本語</option>
+          <option value="한국어">한국어</option>
+          <option value="Français">Français</option>
+          <option value="Español">Español</option>
+          <option value="Deutsch">Deutsch</option>
+          <option value="Русский">Русский</option>
+        </select>
+      </label>
       <button id="reprocess-btn" class="ghost">重新加工记忆</button>
       <button id="reset-btn" class="ghost">重置记忆</button>
     </div>
@@ -96,6 +109,6 @@
     </aside>
   </main>
 
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>

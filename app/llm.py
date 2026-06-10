@@ -4,6 +4,7 @@
 - 没有 key → mock 模式：模板回复 + 规则抽取，让记忆机制在离线下也能完整演示
 """
 
+import asyncio
 import json
 import re
 from typing import Dict, List, Optional
@@ -12,19 +13,28 @@ import httpx
 
 from app import config
 
-# connect 放宽到 15s：跨境调用（如 BytePlus Ark）建连偶有抖动，太短会误判超时。
+_chat_sem = asyncio.Semaphore(config.LLM_CONCURRENCY)
+
+_pool_limits = httpx.Limits(
+    max_connections=config.HTTPX_MAX_CONNECTIONS,
+    max_keepalive_connections=config.HTTPX_MAX_KEEPALIVE,
+)
+_timeout = httpx.Timeout(
+    connect=config.HTTPX_CONNECT_TIMEOUT,
+    read=config.HTTPX_READ_TIMEOUT,
+    write=10.0, pool=10.0,
+)
+
 _client = httpx.AsyncClient(
     base_url=config.CHAT_BASE_URL,
     headers={"Authorization": f"Bearer {config.CHAT_API_KEY}"},
-    timeout=httpx.Timeout(connect=15.0, read=60.0, write=10.0, pool=5.0),
+    timeout=_timeout, limits=_pool_limits,
 )
 
-# 抽取/关系/摘要独立端点（对话放得开用 NSFW 版，抽取要稳用官方 DeepSeek）。
-# 若 .env 未单独配置，则与对话端点同源。
 _extract_client = httpx.AsyncClient(
     base_url=config.EXTRACT_BASE_URL,
     headers={"Authorization": f"Bearer {config.EXTRACT_API_KEY}"},
-    timeout=httpx.Timeout(connect=15.0, read=60.0, write=10.0, pool=5.0),
+    timeout=_timeout, limits=_pool_limits,
 )
 
 
@@ -36,17 +46,18 @@ async def chat(messages: List[Dict], model: Optional[str] = None,
         return _mock_chat(messages)
     client = _extract_client if use_extract_endpoint else _client
     default_model = config.EXTRACT_MODEL if use_extract_endpoint else config.CHAT_MODEL
-    resp = await client.post(
-        "/chat/completions",
-        json={
-            "model": model or default_model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    async with _chat_sem:
+        resp = await client.post(
+            "/chat/completions",
+            json={
+                "model": model or default_model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 async def extract_json(prompt: str, model: Optional[str] = None) -> dict:

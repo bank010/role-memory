@@ -53,6 +53,10 @@ async def max_turn(session: str) -> int:
     return await _store.max_turn(session)
 
 
+async def first_turn_ts(session: str) -> Optional[float]:
+    return await _store.first_turn_ts(session)
+
+
 # ---------------- 逐字记忆（verbatim chunks）----------------
 async def index_chunk(session: str, turn: int, role: str, text: str,
                       user_id: str = "", role_id: str = "") -> None:

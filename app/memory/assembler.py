@@ -28,6 +28,11 @@ _MEMORY_RULES = """[How to use the memory above]
 - Facts about {user} (name/job/preferences/history) must come ONLY from the memory above. If not in memory, say you don't know yet — never invent facts about them. (Your own persona details and in-scene improvisation are free.)
 - Weave remembered facts/episodes into the reply naturally; do not list them out or mention "memory"."""
 
+# 接口显式指定回复语言时注入（优先级高于角色卡语言）；未指定则不注入，由角色卡决定。
+_LANGUAGE_RULE = ("[Language - MANDATORY]\n"
+                  "- You MUST reply in {language} ONLY, no matter what language "
+                  "the persona card or earlier replies used.")
+
 
 def memory_user_name(facts: List[Dict]) -> str:
     """从记忆里取用户名（identity:nickname / name）；取不到返回空串。"""
@@ -110,7 +115,8 @@ def _build_retrieval_query(user_msg: str, window: List[Dict]) -> str:
 
 async def build_context(session: str, persona: str, user_msg: str,
                         char_name: str = "Character",
-                        user_name: str = None) -> Tuple[List[Dict], Dict]:
+                        user_name: str = None,
+                        language: str = None) -> Tuple[List[Dict], Dict]:
     """返回 (messages, debug)。debug 用于前端可视化本轮检索过程。
 
     {{char}}/{{user}} 用前端传入的 char_name/user_name 替换；
@@ -118,12 +124,13 @@ async def build_context(session: str, persona: str, user_msg: str,
     """
     t0 = time.perf_counter()
 
-    # 1) 先并行取轻量数据：facts / relationship / 工作窗口 / max_turn（毫秒级 DB 读）
-    facts, rel, window, now_turn = await asyncio.gather(
+    # 1) 先并行取轻量数据：facts / relationship / 工作窗口 / max_turn / 首轮时间（毫秒级 DB 读）
+    facts, rel, window, now_turn, first_ts = await asyncio.gather(
         stores.all_facts(session),
         stores.get_relationship(session),
         stores.recent_turns(session, config.WORKING_WINDOW),
         stores.max_turn(session),
+        stores.first_turn_ts(session),
     )
 
     # 2) 检索 query 增强（短消息/指代补全语境）后只 embed 一次（Redis 缓存），两路召回共享
@@ -151,8 +158,13 @@ async def build_context(session: str, persona: str, user_msg: str,
     parts = [persona.strip(), ""]
 
     parts.append("[Current relationship state]")
+    parts.append(f"- The person you are talking to is named: {user_name}")
     parts.append(f"- Intimacy: {rel['intimacy']:.2f} / Trust: {rel['trust']:.2f} / Stage: {rel['stage']}")
     parts.append(f"- Current emotional tone: {rel['mood']}")
+    if first_ts:
+        parts.append(f"- You first talked to {user_name}: {_age_label(first_ts, 0, 0)} (total {now_turn} messages so far)")
+    else:
+        parts.append(f"- This is your very first conversation with {user_name}. You have NO shared history yet — do not invent any.")
     parts.append("")
 
     if facts:
@@ -184,6 +196,9 @@ async def build_context(session: str, persona: str, user_msg: str,
         parts.append("")
 
     parts.append(_MEMORY_RULES.replace("{user}", user_name))
+    if (language or "").strip():
+        parts.append("")
+        parts.append(_LANGUAGE_RULE.replace("{language}", language.strip()))
 
     messages = [{"role": "system", "content": "\n".join(parts)}]
     for t in window:

@@ -70,16 +70,13 @@ async def health():
             "personas": personas.list_personas()}
 
 
-# 聊天 UI 按纯文本渲染：模型习惯性输出的 markdown 强调/标题符号要剥掉（保留文字内容）。
-# prompt 里已禁用 markdown，这里是硬兜底——角色扮演模型的 *action* 习惯单靠提示词拦不全。
-_MD_EMPHASIS = re.compile(r"\*{1,3}([^*\n]+?)\*{1,3}")
 _MD_HEADER = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 
 
 def _strip_markdown(text: str) -> str:
-    if not text or ("*" not in text and "#" not in text):
+    """只剥 markdown 标题符号；保留 *action* 星号（角色扮演通用格式）。"""
+    if not text or "#" not in text:
         return text
-    text = _MD_EMPHASIS.sub(r"\1", text)
     return _MD_HEADER.sub("", text)
 
 
@@ -96,10 +93,19 @@ async def chat(req: ChatRequest):
 
     t0 = time.perf_counter()
 
-    # 1) 读路径（在线，快）：拼装上下文
-    messages, debug = await assembler.build_context(
-        session, persona, req.message, char_name, req.user_name
-    )
+    # 1) 读路径（在线，快）：拼装上下文（含 embedding 调用，可能超时）
+    try:
+        messages, debug = await assembler.build_context(
+            session, persona, req.message, char_name, req.user_name, req.language
+        )
+    except Exception as e:
+        log.error("记忆读路径失败 session=%s err=%r", session, e)
+        return JSONResponse(
+            status_code=503,
+            content={"error": "memory_unavailable",
+                     "message": "记忆服务暂时不可用（embedding 超时或网络波动），请稍后重试。",
+                     "detail": str(e)},
+        )
     t_ctx = time.perf_counter()
 
     # 2) 生成回复（LLM 端点可能超时/报错：返回结构化 JSON 错误，前端能正常解析，不再裸 500）

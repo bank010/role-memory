@@ -57,8 +57,11 @@
 | **NSFW 分级** | `sensitive` 标记隔离，`NSFW_ENABLED` 总开关控制提取与注入 |
 | **主动推进剧情** | System prompt 内嵌叙事引导，AI 主动制造情节、不被动应答 |
 | **并发安全** | 进程内 session 级加工锁 + Redis 分布式锁（多 worker/多实例互斥）；加工失败不推进游标，下次重试不丢记忆 |
-| **可插拔存储** | SQLite（零依赖）/ PostgreSQL + pgvector + HNSW（生产级），一行配置切换 |
+| **连接池 + 信号量限流** | 所有外部 API（LLM/Embedding/Rerank）统一 httpx 连接池 + 并发信号量，防止瞬间打爆下游；失败自动重试 |
+| **全链路容错** | Embedding/LLM/Rerank 任一环节超时或失败均返回结构化错误（503），不再裸 500；精排超时降级、缓存不可用降级 |
+| **可插拔存储** | SQLite（零依赖，WAL 模式）/ PostgreSQL + pgvector + HNSW（生产级），一行配置切换 |
 | **Redis 热缓存** | facts/relationship 热读 + 查询 embedding 缓存，未配置时自动降级，绝不成为故障点 |
+| **真实时间线注入** | System prompt 注入首次对话时间和消息总数，模型不再编造虚假的相识历史 |
 | **CORS 支持** | 内置跨域中间件，前后端分离开箱即用 |
 
 ---
@@ -456,18 +459,30 @@ FACT_MERGE_THRESHOLD=0.86  # 事实语义合并阈值（同类实体相似度超
 NSFW_ENABLED=1         # 敏感画像/事件提取与注入总开关
 NORMALIZE_ENABLED=0    # 多语言归一化（用 Qwen3-Embedding 时关闭）
 
+# ── 连接池与并发控制（面向高并发生产环境）─────────────────────
+HTTPX_MAX_CONNECTIONS=500   # 每端点最大 TCP 连接数
+HTTPX_MAX_KEEPALIVE=100     # 长连接复用数
+HTTPX_CONNECT_TIMEOUT=15    # 建连超时（秒）
+HTTPX_READ_TIMEOUT=60       # 读超时（秒）
+EMBED_CONCURRENCY=50        # Embedding API 最大并发（信号量限流，防打爆 vLLM）
+LLM_CONCURRENCY=100         # LLM API 最大并发
+RERANK_CONCURRENCY=30       # Rerank API 最大并发
+API_RETRIES=2               # 外部 API 失败重试次数
+
 # ── 存储后端 ─────────────────────────────────────────────────
 STORE_BACKEND=sqlite   # sqlite | postgres
 PG_DSN=postgresql://memory:memory@localhost:5432/role_memory
-PG_POOL_MIN=2          # 异步连接池下限
-PG_POOL_MAX=20         # 异步连接池上限（多实例部署按 实例数×上限 规划 PG 连接数）
+PG_POOL_MIN=10         # Postgres 异步连接池下限（高并发建议 ≥10）
+PG_POOL_MAX=100        # Postgres 异步连接池上限（5000 并发建议 ≥100）
 
 # ── Redis 热缓存 ─────────────────────────────────────────────
 # 启用后同时获得：facts/relationship 热读缓存、查询 embedding 缓存、
 # 跨实例记忆加工分布式锁（多 worker 部署强烈建议开启）
 # REDIS_URL=redis://localhost:6379/0
 CACHE_TTL=600
-EMBED_CACHE_TTL=3600   # 查询 embedding 缓存 TTL
+EMBED_CACHE_TTL=3600        # 查询 embedding 缓存 TTL
+REDIS_MAX_CONNECTIONS=200   # Redis 连接池大小
+REDIS_SOCKET_TIMEOUT=5      # Redis 读写超时（秒）
 
 # ── CORS（前后端分离）────────────────────────────────────────
 # 留空=放行所有来源；生产建议填前端域名白名单
@@ -537,6 +552,34 @@ RERANK_API_KEY=vllm
 uvicorn app.main:app --workers 4 --port 8011
 ```
 
+### 压力测试
+
+项目自带压力测试脚本（`stress_test.py`），支持自定义并发数和轮数：
+
+```bash
+python stress_test.py -c 200           # 200 并发，每用户 1 轮
+python stress_test.py -c 1000 -r 3     # 1000 并发，每用户连续 3 轮
+```
+
+**实测结果**（SQLite + 远程 vLLM Embedding + BytePlus Ark LLM，单 worker）：
+
+| 并发数 | 成功率 | QPS | 平均延迟 | P95 |
+|---|---|---|---|---|
+| 200 | 100% | 9.5 | 9.3s | 14.8s |
+| 500 | 100% | 8.8 | 10.4s | 17.0s |
+| 1000 | 99.7% | 8.3 | 20.9s | 35.4s |
+
+> 瓶颈在远程 LLM/Embedding API 的排队延迟，非应用层。切 Postgres + 多 worker + Embedding 多副本可进一步提升。
+
+### 并发调优指南
+
+| 目标并发 | 建议配置 |
+|---|---|
+| < 100 | 默认配置即可（SQLite + 单 worker） |
+| 100 ~ 500 | 调高 `EMBED_CONCURRENCY=80`，开启 Redis |
+| 500 ~ 2000 | 切 Postgres（`PG_POOL_MAX=100`），`--workers 4`，Embedding 多副本 |
+| 2000+ | 多实例部署 + PgBouncer + Redis 集群 + LLM/Embedding 服务横向扩展 |
+
 ---
 
 ## API 接口
@@ -588,6 +631,7 @@ role-memory/
 ├── .env.example             # 环境变量模板（含所有字段说明）
 ├── docker-compose.yml       # 一键拉起 pgvector + Redis
 ├── requirements.txt         # Python 依赖
+├── stress_test.py           # 压力测试脚本（200~5000 并发，含分段计时）
 └── pytest.ini               # 测试配置
 ```
 
