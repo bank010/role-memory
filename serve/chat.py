@@ -12,7 +12,7 @@ import time
 from typing import Dict, Optional
 
 from core import MemoryBox
-from core import llm
+from core.client import llm
 from personas import get_persona, get_char_name
 
 log = logging.getLogger("serve.chat")

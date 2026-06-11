@@ -15,7 +15,10 @@ import unicodedata
 import weakref
 from typing import Dict, List, Optional
 
-from . import cache, config, llm, stores
+from .. import config
+from ..client import llm
+from ..util import cache
+from . import stores
 
 log = logging.getLogger("memory.pipeline")
 
@@ -204,7 +207,7 @@ def _ensure_appendable_entity(key: str, value: str) -> str:
       key="nsfw:xp",       value="user enjoys voyeurism" -> "nsfw:xp:voyeurism"   (追加)
       key="identity:age",  value="26"                    -> "identity:age"        (覆盖)
     """
-    from . import profile_schema
+    from . import schema as profile_schema
     parts = key.split(":")
     if len(parts) == 2 and not profile_schema.is_single_value_key(key):
         return f"{key}:{_slug_from_value(value)}"
@@ -426,7 +429,7 @@ async def _process(session: str, after: int, now: int,
     known_facts = "\n".join(f"- {f['key']}: {f['value']}" for f in known) or "(none yet)"
     prev_summary = (rel_now.get("summary") or "").strip()
 
-    from . import profile_schema
+    from . import schema as profile_schema
     field_catalog = profile_schema.prompt_field_catalog(include_sensitive=config.NSFW_ENABLED)
 
     # 两路 LLM 并行：抽取与摘要互不依赖，不必串行等待

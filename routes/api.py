@@ -5,7 +5,9 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from core import config, cache, rerank
+from core import config
+from core.client import rerank
+from core.util import cache
 from personas import list_personas
 from schemas import ChatRequest, ResetRequest
 from serve.chat import chat_with_memory

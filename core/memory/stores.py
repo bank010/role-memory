@@ -17,8 +17,10 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from . import cache, config, embeddings
-from .store import get_store
+from .. import config
+from ..client import embeddings
+from ..util import cache
+from ..store import get_store
 
 log = logging.getLogger("memory.stores")
 
@@ -64,7 +66,7 @@ async def index_chunk(session: str, turn: int, role: str, text: str,
 
     多语言：embedding 基于归一化到基准语言的文本(norm)，原文(text)保留显示。
     """
-    from . import normalizer
+    from ..util import normalizer
 
     text = (text or "").strip()
     if not text:
@@ -105,7 +107,7 @@ async def upsert_fact(session: str, key: str, value: str, confidence: float, tur
       超过阈值 → 复用其 key 更新（同一条目的不同表述/改口），否则新增（同类不同条目各存一条）。
     这样既不会把"香菜/虾"误合并，又能把"cilantro/coriander/香菜"归并到一条。
     """
-    from . import normalizer
+    from ..util import normalizer
 
     category, entity = _split_key(key)
 
@@ -154,7 +156,7 @@ async def evict_facts_if_needed(session: str) -> None:
 
     单值字段（姓名/年龄/职业等核心身份）不参与淘汰——它们数量天然有限且最重要。
     """
-    from . import profile_schema
+    from . import schema as profile_schema
 
     count = await _store.count_facts(session)
     if count <= config.MAX_FACTS:
@@ -180,7 +182,7 @@ async def all_facts(session: str) -> List[Dict]:
     # 热读：拼上下文每轮都要，走 Redis 读穿透
     facts = await cache.cached(session, "facts", lambda: _store.all_facts(session))
     # 按 schema 标注高敏感字段（不进缓存键，读出时即时标注，避免缓存里混存语义）
-    from . import profile_schema
+    from . import schema as profile_schema
     for f in facts:
         f["sensitive"] = profile_schema.is_sensitive_key(f.get("key", ""))
     return facts
@@ -196,7 +198,7 @@ async def add_episode(session: str, event: str, emotion: str, importance: int, t
 
     sensitive: 亲密/敏感事件（如"发生了亲密关系"）打标，便于后续隔离/开关控制注入。
     """
-    from . import normalizer
+    from ..util import normalizer
     vec = await embeddings.embed(await normalizer.to_base_lang(event))
 
     # 去重只需比最相似的若干条：走 KNN 候选（postgres），sqlite 等价于全部

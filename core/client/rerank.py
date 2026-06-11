@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 import httpx
 
-from . import config
+from .. import config
 
 log = logging.getLogger("rerank")
 

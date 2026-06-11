@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
-from . import config
+from .. import config
 
 _chat_sem = asyncio.Semaphore(config.LLM_CONCURRENCY)
 

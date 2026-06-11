@@ -9,8 +9,11 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple
 
-from . import assembler, cache, config, embeddings, pipeline, rerank, stores
-from .session import make_session
+from . import config
+from .client import embeddings, rerank
+from .util import cache
+from .util.session import make_session
+from .memory import assembler, pipeline, stores
 
 log = logging.getLogger("memory_box")
 

@@ -22,7 +22,9 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from . import config, embeddings, rerank, stores
+from .. import config
+from ..client import embeddings, rerank
+from . import stores
 
 
 def _time_decay(ts) -> float:
@@ -63,7 +65,7 @@ async def retrieve_episodes(session: str, query: str, top_k: int = None,
     top_k = top_k or config.RETRIEVE_TOP_K
 
     if qvec is None:
-        from . import normalizer
+        from ..util import normalizer
         qvec = await embeddings.embed_query(await normalizer.to_base_lang(query))
     # 候选预筛：postgres 走 pgvector 原生 KNN 取 top-N，sqlite 取全部；再做三维重排
     episodes = await stores.candidate_episodes(session, qvec, max(top_k * 4, 20))
@@ -151,7 +153,7 @@ async def retrieve_verbatim(session: str, query: str, top_k: int = None,
 
     # 多语言：query 归一到基准语言再向量化（NORMALIZE 关闭时即原文，推荐多语言 embedding）
     if qvec is None:
-        from . import normalizer
+        from ..util import normalizer
         qvec = await embeddings.embed_query(await normalizer.to_base_lang(query))
 
     # 候选预筛：postgres 走 pgvector KNN 取 top-N（避免全量加载），sqlite 取全部
@@ -190,7 +192,7 @@ async def select_facts(session: str, qvec: np.ndarray, facts: List[Dict],
     单值字段（姓名/年龄/职业等核心身份，无实体向量）始终保留——它们数量少且每轮都该在场。
     多值偏好按分数取 top，避免重度用户的画像撑爆 system prompt。
     """
-    from . import profile_schema
+    from . import schema as profile_schema
 
     top_k = top_k or config.FACTS_INJECT_TOP_K
     if len(facts) <= top_k:
