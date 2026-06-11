@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from core import config
+from core.archive import mongo
 from core.client import rerank
 from core.util import cache
 from personas import list_personas
@@ -82,6 +83,27 @@ async def history(session: str = None, user_id: str = None, role_id: str = None,
         n=n, session=session,
     )
     return {"turns": turns}
+
+
+@router.get("/conversations")
+async def conversations(
+    user_id: str = None,
+    role_id: str = None,
+    limit: int = 20,
+    skip: int = 0,
+    full: bool = False,
+    order: str = "desc",
+):
+    """从 MongoDB 归档库分页拉取历史对话（训练数据 / 外部集成用）。
+
+    与 /history 的区别：/history 读 SQLite/PG 的 turns 表（在线记忆，最近 N 轮原文）；
+    本接口读 Mongo 归档（含完整 prompt、模型、耗时、feedback，支持分页与全量训练样本）。
+    """
+    return await mongo.get_conversations(
+        user_id=(user_id or "").strip(),
+        role_id=(role_id or "").strip(),
+        limit=limit, skip=skip, full=full, order=order,
+    )
 
 
 @router.post("/reprocess")

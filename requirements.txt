@@ -11,3 +11,6 @@ pgvector>=0.3,<0.4
 
 # ---- Redis 热缓存（配置 REDIS_URL 时需要）----
 redis>=5.0,<6
+
+# ---- MongoDB 对话归档（配置 MONGO_URL 时需要）----
+motor>=3.4,<4

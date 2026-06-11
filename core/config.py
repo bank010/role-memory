@@ -141,6 +141,18 @@ REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "200"))
 REDIS_SOCKET_TIMEOUT = float(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
 REDIS_SOCKET_CONNECT_TIMEOUT = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "3"))
 
+# ---- MongoDB 对话归档（训练数据采集 / 对外系统集成）----
+# 与核心记忆（SQLite/Postgres+pgvector）解耦的独立数据湖：
+# 每轮把"完整 prompt（含注入的记忆）+ 回复 + 元信息"异步落一份，供后续偏好训练
+# （点赞/点踩/重新生成）和外部系统读取。留空则关闭，自动降级（不影响对话）。
+MONGO_URL = _get("MONGO_URL", "MONGODB_URL")
+MONGO_DB = _get("MONGO_DB", default="role_memory")
+MONGO_ARCHIVE_COLLECTION = _get("MONGO_ARCHIVE_COLLECTION", default="conversations")
+ARCHIVE_ENABLED = bool(MONGO_URL)
+# Mongo 连接池上限 + 连接/选主超时（毫秒）：连不上快速失败并降级，绝不拖慢回复
+MONGO_MAX_POOL = int(os.getenv("MONGO_MAX_POOL", "100"))
+MONGO_TIMEOUT_MS = int(os.getenv("MONGO_TIMEOUT_MS", "3000"))
+
 # ---- CORS（前后端分离）----
 # 逗号分隔的前端域名白名单；留空则放行所有来源（"*"）。
 # 例：CORS_ORIGINS=https://app.example.com,http://localhost:3000

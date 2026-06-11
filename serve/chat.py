@@ -6,16 +6,22 @@
 3. 把本轮对话存回 MemoryBox（后台异步加工）
 """
 
+import asyncio
 import logging
 import re
 import time
 from typing import Dict, Optional
 
-from core import MemoryBox
+from core import MemoryBox, config
+from core.archive import mongo
 from core.client import llm
+from core.util.session import make_session
 from personas import get_persona, get_char_name
 
 log = logging.getLogger("serve.chat")
+
+# 归档后台任务集合（fire-and-forget，持引用防被 GC 提前回收）
+_archive_tasks: set = set()
 
 _MD_HEADER = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 
@@ -66,6 +72,13 @@ async def chat_with_memory(
     timing["llm"] = round((t_llm - t_ctx) * 1000, 1)
     timing["total"] = round((t_llm - t0) * 1000, 1)
 
+    _archive_async(
+        user_id=user_id, role_id=role_id, turn=turn,
+        user_msg=message, reply=reply,
+        system_prompt=debug.get("system_prompt", ""),
+        messages=messages, char_name=char_name, timing=timing,
+    )
+
     return {
         "reply": reply,
         "turn": turn,
@@ -79,3 +92,34 @@ async def chat_with_memory(
             "timing_ms": timing,
         },
     }
+
+
+def _archive_async(
+    user_id: str,
+    role_id: str,
+    turn: int,
+    user_msg: str,
+    reply: str,
+    system_prompt: str,
+    messages: list,
+    char_name: str,
+    timing: Dict,
+) -> None:
+    """把本轮对话异步归档到 MongoDB（训练数据湖）。fire-and-forget，绝不阻塞回复。"""
+    if not mongo.enabled():
+        return
+    sid, _, _ = make_session(user_id, role_id, None)
+
+    async def _run():
+        try:
+            await mongo.archive_turn(
+                user_id=user_id, role_id=role_id, session=sid, turn=turn,
+                user_msg=user_msg, reply=reply,
+                system_prompt=system_prompt, messages=messages,
+                char_name=char_name, model=config.CHAT_MODEL, timing_ms=timing,
+            )
+        except Exception as e:
+            log.error("对话归档失败 session=%s turn=%s err=%r", sid, turn, e)
+
+    _archive_tasks.add(t := asyncio.create_task(_run()))
+    t.add_done_callback(_archive_tasks.discard)
